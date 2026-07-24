@@ -1,0 +1,1361 @@
+const CounterOrder = require("../model/counterOrderModel")
+const Branch = require("../model/Branch")
+const CounterInvoice = require("../model/counterInvoiceModel")
+const Menu = require("../model/menuModel")
+const Counter = require("../model/counterLoginModel")
+const asyncHandler = require("express-async-handler")
+const Recipe = require("../model/recipe")
+const RawMaterial = require("../model/rawMaterialModel")
+
+/**
+ * Auto-deduct raw material stock based on recipe ingredients.
+ * Each menu item can have a Recipe linked via menuItemId.
+ * Deducts: ingredient.quantity × orderItem.quantity from RawMaterial.quantity
+ * The RawMaterial pre-save hook automatically updates the status field.
+ */
+async function deductRawMaterialsForOrder(items) {
+  for (const item of items) {
+    if (!item.menuItemId) continue
+
+    const recipe = await Recipe.findOne({ menuItemId: item.menuItemId })
+    if (!recipe || !recipe.ingredients || recipe.ingredients.length === 0) continue
+
+    for (const ingredient of recipe.ingredients) {
+      const deductQty = ingredient.quantity * item.quantity
+      if (deductQty <= 0) continue
+
+      try {
+        // $inc deducts atomically; Math.max(0) guard in pre-save handles going negative
+        await RawMaterial.findOneAndUpdate(
+          { _id: ingredient.rawMaterialId },
+          { $inc: { quantity: -deductQty } },
+          { new: true }
+        ).then(async (doc) => {
+          if (doc) {
+            // Clamp to 0 if went negative and trigger status update via save
+            if (doc.quantity < 0) {
+              doc.quantity = 0
+              await doc.save()
+            } else {
+              await doc.save() // triggers pre-save status update
+            }
+          }
+        })
+      } catch (err) {
+        console.error(`[Stock Deduct] Error for rawMaterial ${ingredient.rawMaterialId}:`, err.message)
+        // Non-fatal — order is already saved, don't block the response
+      }
+    }
+  }
+}
+
+// Tax and service charge rates (same as staff order)
+const TAX_RATE = 0.05 // 5%
+const SERVICE_CHARGE_RATE = 0.1 // 10%
+exports.createCounterOrder = asyncHandler(async (req, res) => {
+
+  
+  const {
+    userId,
+    customerName,
+    phoneNumber,
+    branchId,
+    branchName,
+    categoryId,
+    categoryName,
+    invoiceId,
+    items,
+    paymentMethod,
+    status,
+    paymentStatus: reqPaymentStatus,
+    orderStatus: reqOrderStatus,
+    isComplimentary = false,
+    complimentaryReason = null,
+    // Optional: allow frontend to send these, but we'll calculate them
+    subtotal: providedSubtotal,
+    tax: providedTax,
+    serviceCharge: providedServiceCharge,
+    totalAmount: providedTotalAmount,
+    grandTotal: providedGrandTotal,
+    gstAmount: providedGstAmount, // ✅ Accept GST amount from frontend
+  } = req.body
+
+  // 🔍 DEBUG: Log GST amount received
+  console.log('🔍 [createCounterOrder] Received gstAmount from frontend:', providedGstAmount)
+  console.log('🔍 [createCounterOrder] Request body GST:', {
+    gstAmount: req.body.gstAmount,
+    subtotal: providedSubtotal,
+    grandTotal: providedGrandTotal
+  })
+
+  console.log('[createCounterOrder] Incoming bill:', {
+    invoiceNumber: req.body.invoiceNumber,
+    branchId,
+    categoryName,
+    categoryId,
+    itemCount: items ? items.length : 0,
+    paymentMethod,
+    totalAmount: providedTotalAmount,
+    userId,
+  })
+
+  // Validate input — only items and branchId are mandatory; user details are optional
+  if (!branchId) {
+    res.status(400)
+    throw new Error("Branch is required")
+  }
+
+  // Make invoiceId optional for KOT orders - they can be created without invoice initially
+  // if (!invoiceId) {
+  //   res.status(400)
+  //   throw new Error("Invoice is required")
+  // }
+
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    res.status(400)
+    throw new Error("Items are required")
+  }
+
+  if (paymentMethod && !["cash", "card", "upi", "qr"].includes(paymentMethod)) {
+    res.status(400)
+    throw new Error("Invalid payment method")
+  }
+
+  // Verify counter user exists (optional - allow orders even if user not found)
+  let counterUser = null
+  try {
+    counterUser = await Counter.findById(userId)
+    // if (!counterUser) {
+    //   console.log(`Counter user ${userId} not found, proceeding with order anyway`)
+    // }
+  } catch (err) {
+    console.log(`Error finding counter user: ${err.message}, proceeding with order anyway`)
+  }
+
+  // Verify branch exists — only reject on CastError (bad ObjectId format)
+  // Network/connection errors should not block the order save
+  let branch = null
+  try {
+    branch = await Branch.findById(branchId)
+  } catch (err) {
+    if (err.name === 'CastError') {
+      res.status(400)
+      throw new Error(`Invalid branchId format: ${branchId}`)
+    }
+    // Network/DB connection error — log and proceed without branch validation
+    console.warn(`[createCounterOrder] Branch lookup failed (DB connection issue): ${err.message} — proceeding anyway`)
+    branch = { _id: branchId, name: 'Unknown' } // synthetic branch to pass the null check
+  }
+  if (!branch) {
+    res.status(404)
+    throw new Error("Branch not found")
+  }
+
+  // Verify invoice exists (optional - allow orders even if invoice not found)
+  let invoice = null
+  if (invoiceId) {
+    try {
+      invoice = await CounterInvoice.findById(invoiceId)
+      // if (!invoice) {
+      //   console.log(`Invoice ${invoiceId} not found, proceeding with order anyway`)
+      // }
+    } catch (err) {
+      console.log(`Error finding invoice: ${err.message}, proceeding with order anyway`)
+    }
+  } else {
+    console.log('No invoiceId provided, creating order without invoice reference')
+  }
+
+  // Calculate subtotal and validate items
+  let calculatedSubtotal = 0
+  for (const item of items) {
+    if (!item.name || !item.quantity || item.price === undefined) {
+      res.status(400)
+      throw new Error("Invalid item data: name, quantity and price are required")
+    }
+
+    // menuItemId is optional — if missing or invalid ObjectId, skip DB lookup
+    if (item.menuItemId && /^[0-9a-fA-F]{24}$/.test(String(item.menuItemId))) {
+      try {
+        await Menu.findById(item.menuItemId) // result ignored — price from frontend is used
+      } catch (_) {
+        // CastError or DB error — ignore, use provided price
+      }
+    }
+
+    calculatedSubtotal += item.price * item.quantity
+  }
+
+  // For counter orders, use provided tax and service charge (allow 0%)
+  // If not provided, default to 0 for counter orders
+  const finalTax = providedTax !== undefined ? providedTax : 0
+  const finalServiceCharge = providedServiceCharge !== undefined ? providedServiceCharge : 0
+  const finalTotalAmount = providedTotalAmount !== undefined ? providedTotalAmount : calculatedSubtotal
+  const finalGrandTotal = providedGrandTotal !== undefined ? providedGrandTotal : calculatedSubtotal + finalTax + finalServiceCharge
+
+  // Note: subtotal mismatch check removed — offline bills with discounts may differ
+
+  // Create order with provided or default amounts
+  const counterOrder = new CounterOrder({
+    userId: userId || null,
+    customerName: customerName ? customerName.trim() : 'Walk-in Customer',
+    phoneNumber: /^\d{10}$/.test(phoneNumber || '') ? phoneNumber.trim() : '0000000000',
+    branch: branchId,
+    branchName: branchName || null,
+    categoryId: categoryId || null,
+    categoryName: categoryName || null,
+    invoice: invoiceId || null, // Make invoice optional
+    tableId: req.body.tableId || null,
+    tableNumber: req.body.tableNumber || null,
+    serverName: req.body.serverName || null, // Server/Waiter name
+    kotNumber: req.body.kotNumber || null,
+    kotTime: req.body.kotTime || null,
+    invoiceNumber: req.body.invoiceNumber || null, // Add invoiceNumber field
+    items,
+    subtotal: calculatedSubtotal,
+    gstAmount: providedGstAmount || 0, // ✅ Save GST amount from frontend
+    tax: finalTax,
+    serviceCharge: finalServiceCharge,
+    totalAmount: finalTotalAmount,
+    grandTotal: finalGrandTotal,
+    isComplimentary,
+    complimentaryReason,
+    paymentMethod: ["cash", "card", "upi", "qr"].includes(paymentMethod) ? paymentMethod : 'cash',
+    // If paymentStatus is 'completed', orderStatus must also be 'completed' regardless of what was sent
+    orderStatus: (reqPaymentStatus === 'completed' || status === 'completed')
+      ? 'completed'
+      : (reqOrderStatus && ["pending", "processing", "completed", "cancelled"].includes(reqOrderStatus)
+          ? reqOrderStatus
+          : "processing"),
+    paymentStatus: reqPaymentStatus && ["pending", "completed", "failed", "refunded", "consolidated"].includes(reqPaymentStatus)
+      ? reqPaymentStatus
+      : (status || "completed"),
+  })
+
+  // Save to database
+  // console.log('💾 Saving counter order with category info:', {
+  //   categoryName: counterOrder.categoryName,
+  //   branchName: counterOrder.branchName,
+  //   categoryId: counterOrder.categoryId
+  // });
+  
+  try {
+    await counterOrder.save()
+  } catch (saveErr) {
+    // If MongoDB is disconnected, return 503 so the frontend knows to retry later
+    const errorMessage = saveErr.message || '';
+    if (saveErr.name === 'MongoNetworkError' || errorMessage.includes('ENOTFOUND') || errorMessage.includes('buffering timed out') || errorMessage.includes('topology was destroyed')) {
+      res.status(503)
+      throw new Error('Database temporarily unavailable. Bill saved locally and will sync when connection is restored.')
+    }
+    throw saveErr
+  }
+  
+  console.log('[createCounterOrder] Saved successfully:', counterOrder.invoiceNumber || counterOrder._id)
+
+  // Auto-deduct raw material stock based on recipe ingredients (non-blocking)
+  deductRawMaterialsForOrder(counterOrder.items).catch((err) =>
+    console.error('[Recipe Stock Deduct] Error:', err.message)
+  )
+
+  // Populate related data
+  const populatedOrder = await CounterOrder.findById(counterOrder._id)
+    .populate("userId", "name mobile")
+    .populate("branch", "name address")
+    .populate("invoice", "invoiceNumber")
+    .populate("items.menuItemId", "name")
+
+  res.status(201).json({
+    message: "Counter order created successfully",
+    order: {
+      id: populatedOrder._id,
+      userId: populatedOrder.userId ? {
+        id: populatedOrder.userId._id,
+        name: populatedOrder.userId.name,
+        mobile: populatedOrder.userId.mobile,
+      } : null,
+      customerName: populatedOrder.customerName,
+      phoneNumber: populatedOrder.phoneNumber,
+      branch: {
+        id: populatedOrder.branch._id,
+        name: populatedOrder.branch.name,
+        location: populatedOrder.branch.address,
+      },
+      invoice: populatedOrder.invoice ? {
+        id: populatedOrder.invoice._id,
+        invoiceNumber: populatedOrder.invoice.invoiceNumber,
+      } : null,
+  
+    },
+  })
+})
+exports.getCounterOrderById = asyncHandler(async (req, res) => {
+  const { id } = req.params
+
+  // Validate ObjectId format
+  if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+    res.status(400)
+    throw new Error("Invalid order ID format")
+  }
+
+  const counterOrder = await CounterOrder.findById(id)
+    .populate("userId", "name mobile")
+    .populate("branch", "name address")
+    .populate("invoice", "invoiceNumber")
+    .populate("items.menuItemId", "name")
+
+  if (!counterOrder) {
+    res.status(404)
+    throw new Error("Counter order not found")
+  }
+
+  res.status(200).json({
+    order: {
+      id: counterOrder._id,
+      userId: counterOrder.userId ? {
+        id: counterOrder.userId._id,
+        name: counterOrder.userId.name,
+        mobile: counterOrder.userId.mobile,
+      } : null,
+      customerName: counterOrder.customerName,
+      phoneNumber: counterOrder.phoneNumber,
+      branch: {
+        id: counterOrder.branch._id,
+        name: counterOrder.branch.name,
+        location: counterOrder.branch.address,
+      },
+      invoice: counterOrder.invoice ? {
+        id: counterOrder.invoice._id,
+        invoiceNumber: counterOrder.invoice.invoiceNumber,
+      } : null,
+      items: counterOrder.items,
+      subtotal: counterOrder.subtotal,
+      gstAmount: counterOrder.gstAmount || 0,
+      tax: counterOrder.tax,
+      serviceCharge: counterOrder.serviceCharge,
+      totalAmount: counterOrder.totalAmount,
+      grandTotal: counterOrder.grandTotal,
+      paymentMethod: counterOrder.paymentMethod,
+      orderStatus: counterOrder.orderStatus,
+      paymentStatus: counterOrder.paymentStatus,
+      cancellationReason: counterOrder.cancellationReason,
+      cancelledAt: counterOrder.cancelledAt,
+      createdAt: counterOrder.createdAt,
+    },
+  })
+})
+exports.getAllCounterOrders = asyncHandler(async (req, res) => {
+  const { 
+    includeComplimentary = false, 
+    startDate, 
+    endDate, 
+    date,
+    page = 1,
+    limit = 50,
+    sortBy = 'createdAt',
+    sortOrder = 'desc',
+    search,
+    invoiceNumber,
+    branchId,
+    categoryName,
+    paymentStatus,
+    orderStatus,
+    paymentMethod
+  } = req.query
+  
+  // console.log('📅 Date filter params:', { startDate, endDate, date });
+  // console.log('🔍 Filter params:', { search, branchId, categoryName, paymentStatus, orderStatus, paymentMethod });
+  
+  // Build query to exclude complimentary orders from sales reports unless explicitly requested
+  const query = {}
+  if (!includeComplimentary || includeComplimentary === 'false') {
+    query.isComplimentary = { $ne: true }
+  }
+
+  // Add date filtering
+  if (date) {
+    // Single date filter - filter for orders on specific date
+    const filterDate = new Date(date);
+    const startOfDay = new Date(filterDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(filterDate);
+    endOfDay.setHours(23, 59, 59, 999);
+    
+    query.createdAt = {
+      $gte: startOfDay,
+      $lte: endOfDay
+    };
+    
+    // console.log('📅 Single date filter applied:', {
+    //   date: date,
+    //   startOfDay: startOfDay,
+    //   endOfDay: endOfDay
+    // });
+  } else if (startDate || endDate) {
+    // Date range filter
+    query.createdAt = {};
+    
+    if (startDate) {
+      const start = new Date(startDate);
+      start.setHours(0, 0, 0, 0);
+      query.createdAt.$gte = start;
+    }
+    
+    if (endDate) {
+      const end = new Date(endDate);
+      end.setHours(23, 59, 59, 999);
+      query.createdAt.$lte = end;
+    }
+    
+    // console.log('📅 Date range filter applied:', {
+    //   startDate: startDate,
+    //   endDate: endDate,
+    //   query: query.createdAt
+    // });
+  }
+
+  // Add search filter - search by customer name, phone number, invoice number, KOT number
+  if (search && search.trim() !== '') {
+    const searchRegex = new RegExp(search.trim(), 'i');
+    query.$or = [
+      { customerName: searchRegex },
+      { phoneNumber: searchRegex },
+      { invoiceNumber: searchRegex },
+      { kotNumber: searchRegex }
+    ];
+  }
+
+  // Exact invoiceNumber lookup (used by sync dedup check — avoids regex false positives)
+  if (invoiceNumber && invoiceNumber.trim() !== '') {
+    query.invoiceNumber = invoiceNumber.trim();
+  }
+
+  // Add branch filter
+  if (branchId) {
+    query.branch = branchId;
+  }
+
+  // Add category filter
+  if (categoryName) {
+    query.categoryName = new RegExp(categoryName.trim(), 'i');
+    // console.log('📂 Category filter applied:', categoryName);
+  }
+
+  // Add payment status filter
+  if (paymentStatus) {
+    query.paymentStatus = paymentStatus;
+  }
+
+  // Add order status filter
+  if (orderStatus) {
+    query.orderStatus = orderStatus;
+  }
+
+  // Add payment method filter
+  if (paymentMethod) {
+    query.paymentMethod = paymentMethod;
+  }
+
+  // console.log('🔍 Final query:', query);
+
+  // Calculate pagination
+  const pageNum = parseInt(page);
+  const limitNum = parseInt(limit);
+  const skip = (pageNum - 1) * limitNum;
+
+  // Build sort object
+  const sort = {};
+  sort[sortBy] = sortOrder === 'asc' ? 1 : -1;
+
+  // Start performance timer
+  const startTime = Date.now();
+
+  // Execute query with pagination
+  const [counterOrders, totalCount] = await Promise.all([
+    CounterOrder.find(query)
+      .populate("userId", "name mobile")
+      .populate("branch", "name address")
+      .populate("invoice", "invoiceNumber")
+      .populate("items.menuItemId", "name")
+      .sort(sort)
+      .skip(skip)
+      .limit(limitNum)
+      .lean(),
+    CounterOrder.countDocuments(query)
+  ]);
+
+  // Log performance
+  const queryTime = Date.now() - startTime;
+  // console.log(`⚡ Query executed in ${queryTime}ms - Found ${counterOrders.length} of ${totalCount} orders`);
+
+  // console.log('📊 Found orders after filters:', counterOrders.length, 'of', totalCount);
+
+  if (!counterOrders || counterOrders.length === 0) {
+    return res.status(200).json({
+      success: true,
+      message: "No counter orders found",
+      data: [],
+      orders: [],
+      pagination: {
+        currentPage: pageNum,
+        totalPages: 0,
+        totalItems: 0,
+        itemsPerPage: limitNum,
+        hasNextPage: false,
+        hasPrevPage: false
+      }
+    })
+  }
+
+  // Add null checks to prevent undefined errors
+  const formattedOrders = counterOrders
+    .map((order) => {
+      // branch is required; userId is optional (offline bills have userId: null)
+      if (!order.branch) {
+        console.warn(`Order ${order._id} has missing branch reference`)
+        return null
+      }
+
+      return {
+        id: order._id,
+        userId: order.userId ? {
+          id: order.userId._id,
+          name: order.userId.name,
+          mobile: order.userId.mobile,
+        } : null,
+        customerName: order.customerName,
+        phoneNumber: order.phoneNumber,
+        branch: {
+          id: order.branch._id,
+          name: order.branch.name,
+          location: order.branch.address,
+        },
+        invoice: order.invoice ? {
+          id: order.invoice._id,
+          invoiceNumber: order.invoice.invoiceNumber,
+        } : null,
+        tableId: order.tableId,
+        tableNumber: order.tableNumber,
+        serverName: order.serverName, // Server/Waiter name
+        kotNumber: order.kotNumber,
+        kotTime: order.kotTime,
+        invoiceNumber: order.invoiceNumber,
+        categoryName: order.categoryName,
+        categoryId: order.categoryId,
+        branchName: order.branchName,
+        items: order.items || [],
+        subtotal: order.subtotal,
+        tax: order.tax,
+        serviceCharge: order.serviceCharge,
+        totalAmount: order.totalAmount,
+        grandTotal: order.grandTotal,
+        paymentMethod: order.paymentMethod,
+        orderStatus: order.orderStatus,
+        paymentStatus: order.paymentStatus,
+        isComplimentary: order.isComplimentary || false,
+        complimentaryReason: order.complimentaryReason,
+        cancellationReason: order.cancellationReason,
+        cancelledBy: order.cancelledBy,
+        cancelledAt: order.cancelledAt,
+        createdAt: order.createdAt,
+        orderDate: order.createdAt,
+      }
+    })
+    .filter((order) => order !== null);
+
+  // Calculate pagination metadata
+  const totalPages = Math.ceil(totalCount / limitNum);
+  const hasNextPage = pageNum < totalPages;
+  const hasPrevPage = pageNum > 1;
+
+  // console.log('✅ Returning formatted orders:', formattedOrders.length);
+
+  res.status(200).json({
+    success: true,
+    message: "Counter orders retrieved successfully",
+    count: formattedOrders.length,
+    data: formattedOrders,
+    orders: formattedOrders,
+    pagination: {
+      currentPage: pageNum,
+      totalPages,
+      totalItems: totalCount,
+      itemsPerPage: limitNum,
+      hasNextPage,
+      hasPrevPage
+    },
+    filters: {
+      includeComplimentary,
+      startDate,
+      endDate,
+      date,
+      search,
+      branchId,
+      categoryName,
+      paymentStatus,
+      orderStatus,
+      paymentMethod
+    }
+  })
+})
+exports.getCounterOrdersByUserId = asyncHandler(async (req, res) => {
+  const { userId } = req.params
+if (!userId.match(/^[0-9a-fA-F]{24}$/)) {
+    res.status(400)
+    throw new Error("Invalid user ID format")
+  }
+
+  const counterOrders = await CounterOrder.find({ userId })
+    .populate("userId", "name mobile")
+    .populate("branch", "name address")
+    .populate("invoice", "invoiceNumber")
+    .populate("items.menuItemId", "name")
+    .sort({ createdAt: -1 })
+
+  if (!counterOrders || counterOrders.length === 0) {
+    return res.status(200).json({
+      message: "No counter orders found for this user",
+      orders: [],
+    })
+  }
+
+  const formattedOrders = counterOrders.map((order) => ({
+    id: order._id,
+    userId: order.userId ? {
+      id: order.userId._id,
+      name: order.userId.name,
+      mobile: order.userId.mobile,
+    } : null,
+    customerName: order.customerName,
+    phoneNumber: order.phoneNumber,
+    branch: {
+      id: order.branch._id,
+      name: order.branch.name,
+      location: order.branch.address,
+    },
+    invoice: order.invoice ? {
+      id: order.invoice._id,
+      invoiceNumber: order.invoice.invoiceNumber,
+    } : null,
+    tableId: order.tableId,
+    tableNumber: order.tableNumber,
+        serverName: order.serverName, // Server/Waiter name
+    kotNumber: order.kotNumber,
+    kotTime: order.kotTime,
+    invoiceNumber: order.invoiceNumber, // ADD: Include invoiceNumber in response
+    items: order.items || [],
+    subtotal: order.subtotal,
+    tax: order.tax,
+    serviceCharge: order.serviceCharge,
+    totalAmount: order.totalAmount,
+    grandTotal: order.grandTotal,
+    paymentMethod: order.paymentMethod,
+    orderStatus: order.orderStatus,
+    paymentStatus: order.paymentStatus,
+    cancellationReason: order.cancellationReason,
+    cancelledAt: order.cancelledAt,
+    createdAt: order.createdAt,
+  }))
+
+  res.status(200).json({
+    message: "Counter orders retrieved successfully",
+    count: formattedOrders.length,
+    orders: formattedOrders,
+  })
+})
+
+exports.updateCounterOrder = asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const updateData = req.body
+
+  // Validate ObjectId format
+  if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+    res.status(400)
+    throw new Error("Invalid order ID format")
+  }
+
+  const counterOrder = await CounterOrder.findById(id)
+  if (!counterOrder) {
+    res.status(404)
+    throw new Error("Counter order not found")
+  }
+
+  // If items are being updated, recalculate totals
+  if (updateData.items) {
+    let calculatedSubtotal = 0
+    for (const item of updateData.items) {
+      calculatedSubtotal += item.price * item.quantity
+    }
+
+    updateData.subtotal = calculatedSubtotal
+    updateData.tax = calculatedSubtotal * TAX_RATE
+    updateData.serviceCharge = calculatedSubtotal * SERVICE_CHARGE_RATE
+    updateData.totalAmount = calculatedSubtotal
+    updateData.grandTotal = calculatedSubtotal + updateData.tax + updateData.serviceCharge
+  }
+
+  // Update the order
+  Object.keys(updateData).forEach((key) => {
+    if (updateData[key] !== undefined) {
+      counterOrder[key] = updateData[key]
+    }
+  })
+
+  await counterOrder.save()
+
+  const populatedOrder = await CounterOrder.findById(id)
+    .populate("userId", "name mobile")
+    .populate("branch", "name address")
+    .populate("invoice", "invoiceNumber")
+    .populate("items.menuItemId", "name")
+
+  res.status(200).json({
+    message: "Counter order updated successfully",
+    order: {
+      id: populatedOrder._id,
+      userId: populatedOrder.userId ? {
+        id: populatedOrder.userId._id,
+        name: populatedOrder.userId.name,
+        mobile: populatedOrder.userId.mobile,
+      } : null,
+      customerName: populatedOrder.customerName,
+      phoneNumber: populatedOrder.phoneNumber,
+      branch: {
+        id: populatedOrder.branch._id,
+        name: populatedOrder.branch.name,
+        location: populatedOrder.branch.address,
+      },
+      invoice: populatedOrder.invoice ? { id: populatedOrder.invoice._id, invoiceNumber: populatedOrder.invoice.invoiceNumber, } : null,
+      tableId: populatedOrder.tableId,
+      tableNumber: populatedOrder.tableNumber,
+      kotNumber: populatedOrder.kotNumber,
+      kotTime: populatedOrder.kotTime,
+      invoiceNumber: populatedOrder.invoiceNumber, // ADD: Include invoiceNumber in response
+      items: populatedOrder.items,
+      subtotal: populatedOrder.subtotal,
+      gstAmount: populatedOrder.gstAmount || 0,
+      tax: populatedOrder.tax,
+      serviceCharge: populatedOrder.serviceCharge,
+      totalAmount: populatedOrder.totalAmount,
+      grandTotal: populatedOrder.grandTotal,
+      paymentMethod: populatedOrder.paymentMethod,
+      orderStatus: populatedOrder.orderStatus,
+      paymentStatus: populatedOrder.paymentStatus,
+      cancellationReason: populatedOrder.cancellationReason,
+      cancelledAt: populatedOrder.cancelledAt,
+      createdAt: populatedOrder.createdAt,
+    },
+  })
+})
+
+// Update order status only
+exports.updateCounterOrderStatus = asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const { orderStatus } = req.body
+
+  // Validate ObjectId format
+  if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+    res.status(400)
+    throw new Error("Invalid order ID format")
+  }
+
+  if (!orderStatus || !["pending", "processing", "completed", "cancelled"].includes(orderStatus)) {
+    res.status(400)
+    throw new Error("Invalid order status. Must be one of: pending, processing, completed, cancelled")
+  }
+
+  const counterOrder = await CounterOrder.findById(id)
+  if (!counterOrder) {
+    res.status(404)
+    throw new Error("Counter order not found")
+  }
+
+  // Check if order is already cancelled
+  if (counterOrder.orderStatus === "cancelled") {
+    res.status(400)
+    throw new Error("Cannot update status of a cancelled order")
+  }
+
+  counterOrder.orderStatus = orderStatus
+  await counterOrder.save()
+
+  const populatedOrder = await CounterOrder.findById(id)
+    .populate("userId", "name mobile")
+    .populate("branch", "name address")
+    .populate("invoice", "invoiceNumber")
+    .populate("items.menuItemId", "name")
+
+  res.status(200).json({
+    message: "Counter order status updated successfully",
+    order: {
+      id: populatedOrder._id,
+      userId: populatedOrder.userId ? {
+        id: populatedOrder.userId._id,
+        name: populatedOrder.userId.name,
+        mobile: populatedOrder.userId.mobile,
+      } : null,
+      customerName: populatedOrder.customerName,
+      phoneNumber: populatedOrder.phoneNumber,
+      branch: {
+        id: populatedOrder.branch._id,
+        name: populatedOrder.branch.name,
+        location: populatedOrder.branch.address,
+      },
+      invoice: populatedOrder.invoice ? { id: populatedOrder.invoice._id, invoiceNumber: populatedOrder.invoice.invoiceNumber, } : null,
+      tableId: populatedOrder.tableId,
+      tableNumber: populatedOrder.tableNumber,
+      kotNumber: populatedOrder.kotNumber,
+      kotTime: populatedOrder.kotTime,
+      invoiceNumber: populatedOrder.invoiceNumber, // ADD: Include invoiceNumber in response
+      items: populatedOrder.items,
+      subtotal: populatedOrder.subtotal,
+      gstAmount: populatedOrder.gstAmount || 0,
+      tax: populatedOrder.tax,
+      serviceCharge: populatedOrder.serviceCharge,
+      totalAmount: populatedOrder.totalAmount,
+      grandTotal: populatedOrder.grandTotal,
+      paymentMethod: populatedOrder.paymentMethod,
+      orderStatus: populatedOrder.orderStatus,
+      paymentStatus: populatedOrder.paymentStatus,
+      cancellationReason: populatedOrder.cancellationReason,
+      cancelledAt: populatedOrder.cancelledAt,
+      createdAt: populatedOrder.createdAt,
+    },
+  })
+})
+
+// Update payment status only
+exports.updateCounterPaymentStatus = asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const { paymentStatus } = req.body
+
+  // Validate ObjectId format
+  if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+    res.status(400)
+    throw new Error("Invalid order ID format")
+  }
+
+  if (!paymentStatus || !["pending", "completed", "failed", "refunded", "consolidated"].includes(paymentStatus)) {
+    res.status(400)
+    throw new Error("Invalid payment status. Must be one of: pending, completed, failed, refunded, consolidated")
+  }
+
+  const counterOrder = await CounterOrder.findById(id)
+  if (!counterOrder) {
+    res.status(404)
+    throw new Error("Counter order not found")
+  }
+
+  // Check if order is cancelled
+  if (counterOrder.orderStatus === "cancelled") {
+    res.status(400)
+    throw new Error("Cannot update payment status of a cancelled order")
+  }
+
+  counterOrder.paymentStatus = paymentStatus
+  await counterOrder.save()
+
+  const populatedOrder = await CounterOrder.findById(id)
+    .populate("userId", "name mobile")
+    .populate("branch", "name address")
+    .populate("invoice", "invoiceNumber")
+    .populate("items.menuItemId", "name")
+
+  res.status(200).json({
+    message: "Counter payment status updated successfully",
+    order: {
+      id: populatedOrder._id,
+      userId: populatedOrder.userId ? {
+        id: populatedOrder.userId._id,
+        name: populatedOrder.userId.name,
+        mobile: populatedOrder.userId.mobile,
+      } : null,
+      customerName: populatedOrder.customerName,
+      phoneNumber: populatedOrder.phoneNumber,
+      branch: {
+        id: populatedOrder.branch._id,
+        name: populatedOrder.branch.name,
+        location: populatedOrder.branch.address,
+      },
+      invoice: populatedOrder.invoice ? { id: populatedOrder.invoice._id, invoiceNumber: populatedOrder.invoice.invoiceNumber, } : null,
+      tableId: populatedOrder.tableId,
+      tableNumber: populatedOrder.tableNumber,
+      kotNumber: populatedOrder.kotNumber,
+      kotTime: populatedOrder.kotTime,
+      invoiceNumber: populatedOrder.invoiceNumber, // ADD: Include invoiceNumber in response
+      items: populatedOrder.items,
+      subtotal: populatedOrder.subtotal,
+      gstAmount: populatedOrder.gstAmount || 0,
+      tax: populatedOrder.tax,
+      serviceCharge: populatedOrder.serviceCharge,
+      totalAmount: populatedOrder.totalAmount,
+      grandTotal: populatedOrder.grandTotal,
+      paymentMethod: populatedOrder.paymentMethod,
+      orderStatus: populatedOrder.orderStatus,
+      paymentStatus: populatedOrder.paymentStatus,
+      cancellationReason: populatedOrder.cancellationReason,
+      cancelledAt: populatedOrder.cancelledAt,
+      createdAt: populatedOrder.createdAt,
+    },
+  })
+})
+
+// Cancel order with reason
+exports.cancelCounterOrder = asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const { cancellationReason, cancelledBy } = req.body
+
+  // Validate ObjectId format
+  if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+    res.status(400)
+    throw new Error("Invalid order ID format")
+  }
+
+  if (!cancellationReason || !cancellationReason.trim()) {
+    res.status(400)
+    throw new Error("Cancellation reason is required")
+  }
+
+  if (cancellationReason.trim().length > 500) {
+    res.status(400)
+    throw new Error("Cancellation reason cannot exceed 500 characters")
+  }
+
+  const counterOrder = await CounterOrder.findById(id)
+  if (!counterOrder) {
+    res.status(404)
+    throw new Error("Counter order not found")
+  }
+
+  // Check if order is already cancelled
+  if (counterOrder.orderStatus === "cancelled") {
+    res.status(400)
+    throw new Error("Order is already cancelled")
+  }
+
+  // REMOVED: Allow cancelling completed orders
+  // if (counterOrder.orderStatus === "completed") {
+  //   res.status(400)
+  //   throw new Error("Cannot cancel a completed order")
+  // }
+
+  // Update order status to cancelled and add cancellation details
+  counterOrder.orderStatus = "cancelled"
+  counterOrder.cancellationReason = cancellationReason.trim()
+  counterOrder.cancelledBy = cancelledBy ? cancelledBy.trim() : null
+  counterOrder.cancelledAt = new Date()
+  await counterOrder.save()
+
+  const populatedOrder = await CounterOrder.findById(id)
+    .populate("userId", "name mobile")
+    .populate("branch", "name address")
+    .populate("invoice", "invoiceNumber")
+    .populate("items.menuItemId", "name")
+
+  res.status(200).json({
+    message: "Counter order cancelled successfully",
+    order: {
+      id: populatedOrder._id,
+      userId: populatedOrder.userId ? {
+        id: populatedOrder.userId._id,
+        name: populatedOrder.userId.name,
+        mobile: populatedOrder.userId.mobile,
+      } : null,
+      customerName: populatedOrder.customerName,
+      phoneNumber: populatedOrder.phoneNumber,
+      branch: {
+        id: populatedOrder.branch._id,
+        name: populatedOrder.branch.name,
+        location: populatedOrder.branch.address,
+      },
+      invoice: populatedOrder.invoice ? { id: populatedOrder.invoice._id, invoiceNumber: populatedOrder.invoice.invoiceNumber, } : null,
+      tableId: populatedOrder.tableId,
+      tableNumber: populatedOrder.tableNumber,
+      kotNumber: populatedOrder.kotNumber,
+      kotTime: populatedOrder.kotTime,
+      invoiceNumber: populatedOrder.invoiceNumber, // ADD: Include invoiceNumber in response
+      items: populatedOrder.items,
+      subtotal: populatedOrder.subtotal,
+      tax: populatedOrder.tax,
+      serviceCharge: populatedOrder.serviceCharge,
+      totalAmount: populatedOrder.totalAmount,
+      grandTotal: populatedOrder.grandTotal,
+      paymentMethod: populatedOrder.paymentMethod,
+      orderStatus: populatedOrder.orderStatus,
+      paymentStatus: populatedOrder.paymentStatus,
+      cancellationReason: populatedOrder.cancellationReason,
+      cancelledBy: populatedOrder.cancelledBy,
+      cancelledAt: populatedOrder.cancelledAt,
+      createdAt: populatedOrder.createdAt,
+    },
+  })
+})
+
+// Clear all counter orders (for testing/cleanup)
+exports.clearAllCounterOrders = asyncHandler(async (req, res) => {
+  try {
+    // Delete all counter orders
+    const deleteResult = await CounterOrder.deleteMany({})
+    
+    res.status(200).json({
+      message: "All counter orders cleared successfully",
+      deletedCount: deleteResult.deletedCount
+    })
+  } catch (error) {
+    console.error("Error clearing counter orders:", error)
+    res.status(500)
+    throw new Error("Failed to clear counter orders")
+  }
+})
+
+// Get categorized orders with pagination and filtering (optimized for big data)
+exports.getCategorizedOrders = asyncHandler(async (req, res) => {
+  const { 
+    includeComplimentary = false, 
+    startDate, 
+    endDate, 
+    date,
+    page = 1,
+    limit = 50,
+    sortBy = 'createdAt',
+    sortOrder = 'desc',
+    search,
+    branchId,
+    categoryName,
+    paymentStatus,
+    orderStatus,
+    paymentMethod
+  } = req.query
+  
+  // console.log('📊 getCategorizedOrders called with params:', { 
+  //   date, startDate, endDate, categoryName, orderStatus, page, limit 
+  // });
+  
+  // Build query to exclude complimentary orders unless explicitly requested
+  const query = {}
+  if (!includeComplimentary || includeComplimentary === 'false') {
+    query.isComplimentary = { $ne: true }
+  }
+
+  // Only include orders with invoice numbers (completed bills)
+  query.$or = [
+    { invoiceNumber: { $exists: true, $ne: null, $ne: '' } },
+    { 'invoice': { $exists: true, $ne: null } }
+  ]
+
+  // Add date filtering
+  if (date) {
+    const filterDate = new Date(date);
+    const startOfDay = new Date(filterDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(filterDate);
+    endOfDay.setHours(23, 59, 59, 999);
+    
+    query.createdAt = {
+      $gte: startOfDay,
+      $lte: endOfDay
+    };
+  } else if (startDate || endDate) {
+    query.createdAt = {};
+    
+    if (startDate) {
+      const start = new Date(startDate);
+      start.setHours(0, 0, 0, 0);
+      query.createdAt.$gte = start;
+    }
+    
+    if (endDate) {
+      const end = new Date(endDate);
+      end.setHours(23, 59, 59, 999);
+      query.createdAt.$lte = end;
+    }
+  }
+
+  // Add search filter
+  if (search && search.trim() !== '') {
+    const searchRegex = new RegExp(search.trim(), 'i');
+    query.$and = query.$and || [];
+    query.$and.push({
+      $or: [
+        { customerName: searchRegex },
+        { phoneNumber: searchRegex },
+        { invoiceNumber: searchRegex },
+        { kotNumber: searchRegex }
+      ]
+    });
+  }
+
+  // Add branch filter
+  if (branchId) {
+    query.branch = branchId;
+  }
+
+  // Add category filter
+  if (categoryName && categoryName !== 'all') {
+    const categoryLower = categoryName.toLowerCase().trim();
+    
+    if (categoryLower === 'selfservice' || categoryLower === 'self service') {
+      // Self service: categoryName contains 'self service' or 'darshini', OR no table
+      query.$and = query.$and || [];
+      query.$and.push({
+        $or: [
+          { categoryName: /self service|self-service|darshini/i },
+          { $and: [
+            { categoryName: { $not: /restaurant|temple/i } },
+            { $or: [
+              { tableNumber: { $exists: false } },
+              { tableNumber: null },
+              { tableNumber: '' }
+            ]}
+          ]}
+        ]
+      });
+    } else if (categoryLower === 'restaurant') {
+      // Restaurant: categoryName contains 'restaurant' OR has table number
+      query.$and = query.$and || [];
+      query.$and.push({
+        $or: [
+          { categoryName: /restaurant/i },
+          { $and: [
+            { categoryName: { $not: /temple|self service|darshini/i } },
+            { tableNumber: { $exists: true, $ne: null, $ne: '' } }
+          ]}
+        ]
+      });
+    } else if (categoryLower === 'templemeals' || categoryLower === 'temple meals') {
+      // Temple meals: categoryName contains 'temple'
+      query.categoryName = /temple/i;
+    }
+  }
+
+  // Add payment status filter
+  if (paymentStatus) {
+    query.paymentStatus = paymentStatus;
+  }
+
+  // Add order status filter
+  if (orderStatus) {
+    query.orderStatus = orderStatus;
+  }
+
+  // Add payment method filter
+  if (paymentMethod) {
+    query.paymentMethod = paymentMethod;
+  }
+
+  // console.log('🔍 Final query:', JSON.stringify(query, null, 2));
+
+  // Calculate pagination
+  const pageNum = parseInt(page);
+  const limitNum = parseInt(limit);
+  const skip = (pageNum - 1) * limitNum;
+
+  // Build sort object
+  const sort = {};
+  sort[sortBy] = sortOrder === 'asc' ? 1 : -1;
+
+  // Start performance timer
+  const startTime = Date.now();
+
+  // Execute query with pagination
+  const [counterOrders, totalCount] = await Promise.all([
+    CounterOrder.find(query)
+      .populate("userId", "name mobile")
+      .populate("branch", "name address")
+      .populate("invoice", "invoiceNumber")
+      .populate("items.menuItemId", "name")
+      .sort(sort)
+      .skip(skip)
+      .limit(limitNum)
+      .lean(),
+    CounterOrder.countDocuments(query)
+  ]);
+
+  // Calculate category counts (for all matching orders, not just current page)
+  const categoryCounts = await Promise.all([
+    // Self Service count
+    CounterOrder.countDocuments({
+      ...query,
+      $or: [
+        { categoryName: /self service|self-service|darshini/i },
+        { $and: [
+          { categoryName: { $not: /restaurant|temple/i } },
+          { $or: [
+            { tableNumber: { $exists: false } },
+            { tableNumber: null },
+            { tableNumber: '' }
+          ]}
+        ]}
+      ]
+    }),
+    // Restaurant count
+    CounterOrder.countDocuments({
+      ...query,
+      $or: [
+        { categoryName: /restaurant/i },
+        { $and: [
+          { categoryName: { $not: /temple|self service|darshini/i } },
+          { tableNumber: { $exists: true, $ne: null, $ne: '' } }
+        ]}
+      ]
+    }),
+    // Temple Meals count
+    CounterOrder.countDocuments({
+      ...query,
+      categoryName: /temple/i
+    })
+  ]);
+
+  // Calculate statistics for all matching orders (not just current page)
+  const allMatchingOrders = await CounterOrder.find(query).select('grandTotal totalAmount orderStatus').lean();
+  
+  const stats = {
+    totalOrders: totalCount,
+    totalRevenue: 0,
+    cancelledOrders: 0,
+    cancelledAmount: 0,
+    completedOrders: 0,
+    pendingOrders: 0
+  };
+
+  allMatchingOrders.forEach(order => {
+    const status = (order.orderStatus || 'completed').toLowerCase();
+    const amount = order.grandTotal || order.totalAmount || 0;
+    
+    if (status === 'cancelled') {
+      stats.cancelledOrders++;
+      stats.cancelledAmount += amount;
+    } else {
+      stats.totalRevenue += amount;
+      if (status === 'completed') {
+        stats.completedOrders++;
+      } else if (status === 'pending' || status === 'processing') {
+        stats.pendingOrders++;
+      }
+    }
+  });
+
+  // Log performance
+  const queryTime = Date.now() - startTime;
+  // console.log(`⚡ Query executed in ${queryTime}ms - Found ${counterOrders.length} of ${totalCount} orders`);
+
+  if (!counterOrders || counterOrders.length === 0) {
+    return res.status(200).json({
+      success: true,
+      message: "No counter orders found",
+      data: [],
+      orders: [],
+      stats,
+      categoryCounts: {
+        selfService: categoryCounts[0],
+        restaurant: categoryCounts[1],
+        templeMeals: categoryCounts[2]
+      },
+      pagination: {
+        currentPage: pageNum,
+        totalPages: 0,
+        totalItems: 0,
+        itemsPerPage: limitNum,
+        hasNextPage: false,
+        hasPrevPage: false
+      }
+    })
+  }
+
+  // Format orders
+  const formattedOrders = counterOrders
+    .map((order) => {
+      // branch is required; userId is optional (offline bills have userId: null)
+      if (!order.branch) {
+        console.warn(`Order ${order._id} has missing branch reference`)
+        return null
+      }
+
+      return {
+        id: order._id,
+        userId: order.userId ? {
+          id: order.userId._id,
+          name: order.userId.name,
+          mobile: order.userId.mobile,
+        } : null,
+        customerName: order.customerName,
+        phoneNumber: order.phoneNumber,
+        branch: {
+          id: order.branch._id,
+          name: order.branch.name,
+          location: order.branch.address,
+        },
+        invoice: order.invoice ? {
+          id: order.invoice._id,
+          invoiceNumber: order.invoice.invoiceNumber,
+        } : null,
+        tableId: order.tableId,
+        tableNumber: order.tableNumber,
+        serverName: order.serverName, // Server/Waiter name
+        kotNumber: order.kotNumber,
+        kotTime: order.kotTime,
+        invoiceNumber: order.invoiceNumber,
+        categoryName: order.categoryName,
+        categoryId: order.categoryId,
+        branchName: order.branchName,
+        items: order.items || [],
+        subtotal: order.subtotal,
+        tax: order.tax,
+        serviceCharge: order.serviceCharge,
+        totalAmount: order.totalAmount,
+        grandTotal: order.grandTotal,
+        paymentMethod: order.paymentMethod,
+        orderStatus: order.orderStatus,
+        paymentStatus: order.paymentStatus,
+        isComplimentary: order.isComplimentary || false,
+        complimentaryReason: order.complimentaryReason,
+        cancellationReason: order.cancellationReason,
+        cancelledBy: order.cancelledBy,
+        cancelledAt: order.cancelledAt,
+        createdAt: order.createdAt,
+        orderDate: order.createdAt,
+      }
+    })
+    .filter((order) => order !== null);
+
+  // Calculate pagination metadata
+  const totalPages = Math.ceil(totalCount / limitNum);
+  const hasNextPage = pageNum < totalPages;
+  const hasPrevPage = pageNum > 1;
+
+  // console.log('✅ Returning formatted orders:', formattedOrders.length);
+
+  res.status(200).json({
+    success: true,
+    message: "Categorized orders retrieved successfully",
+    count: formattedOrders.length,
+    data: formattedOrders,
+    orders: formattedOrders,
+    stats,
+    categoryCounts: {
+      selfService: categoryCounts[0],
+      restaurant: categoryCounts[1],
+      templeMeals: categoryCounts[2]
+    },
+    pagination: {
+      currentPage: pageNum,
+      totalPages,
+      totalItems: totalCount,
+      itemsPerPage: limitNum,
+      hasNextPage,
+      hasPrevPage
+    },
+    filters: {
+      includeComplimentary,
+      startDate,
+      endDate,
+      date,
+      search,
+      branchId,
+      categoryName,
+      paymentStatus,
+      orderStatus,
+      paymentMethod
+    }
+  })
+})
