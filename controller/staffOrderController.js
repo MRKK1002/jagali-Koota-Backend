@@ -145,6 +145,27 @@ exports.createStaffOrderAfterPayment = async (req, res) => {
     // Set orderId for stock updates
     req.orderId = staffOrder._id
 
+    // 🔥 WEBHOOK: Call CRM backend to deduct department stock based on recipes
+    try {
+      const CRM_API_URL = process.env.CRM_API_URL || "http://localhost:9001";
+      const axios = require("axios");
+      await axios.post(`${CRM_API_URL}/api/v1/hotel/department-stock/deduct-by-recipe`, {
+        items: staffOrder.items.map(item => ({
+          menuItemId: item.menuItemId,
+          menuItemName: item.name,
+          quantity: item.quantity,
+        })),
+        department: "Kitchen", // Default department
+        branch: staffOrder.branchName || "MYSURU",
+        orderId: String(staffOrder._id),
+        orderNumber: staffOrder.orderId,
+      });
+      console.log("✅ CRM stock deduction webhook sent for order:", staffOrder.orderId);
+    } catch (webhookErr) {
+      console.error("⚠️ CRM webhook failed (non-blocking):", webhookErr.message);
+      // Don't fail the order if webhook fails
+    }
+
 
     res.status(201).json({
       success: true,

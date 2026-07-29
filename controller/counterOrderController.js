@@ -250,6 +250,29 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
     console.error('[Recipe Stock Deduct] Error:', err.message)
   )
 
+  // 🔥 WEBHOOK: Call CRM backend to deduct department stock based on recipes
+  try {
+    const CRM_API_URL = process.env.CRM_API_URL || "http://localhost:9001";
+    const axios = require("axios");
+    axios.post(`${CRM_API_URL}/api/v1/hotel/department-stock/deduct-by-recipe`, {
+      items: counterOrder.items.map(item => ({
+        menuItemId: String(item.menuItemId),
+        menuItemName: item.name,
+        quantity: item.quantity,
+      })),
+      department: counterOrder.categoryName || "Kitchen",
+      branch: counterOrder.branchName || "MYSURU",
+      orderId: String(counterOrder._id),
+      orderNumber: counterOrder.invoiceNumber || String(counterOrder._id),
+    }).then(() => {
+      console.log("✅ CRM stock deduction webhook sent for counter order:", counterOrder.invoiceNumber);
+    }).catch(err => {
+      console.error("⚠️ CRM webhook failed (non-blocking):", err.message);
+    });
+  } catch (webhookErr) {
+    console.error("⚠️ CRM webhook error:", webhookErr.message);
+  }
+
   // Populate related data
   const populatedOrder = await CounterOrder.findById(counterOrder._id)
     .populate("userId", "name mobile")
