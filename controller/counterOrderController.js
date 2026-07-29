@@ -260,7 +260,7 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
         menuItemName: item.name,
         quantity: item.quantity,
       })),
-      department: counterOrder.categoryName || "Kitchen",
+      department: "Kitchen",
       branch: counterOrder.branchName || "MYSURU",
       orderId: String(counterOrder._id),
       orderNumber: counterOrder.invoiceNumber || String(counterOrder._id),
