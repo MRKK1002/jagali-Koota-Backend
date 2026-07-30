@@ -1,7 +1,22 @@
 const asyncHandler = require("express-async-handler");
 const Member = require("../models/Member");
 const QRCode = require("qrcode");
-const { uploadFile2 } = require("../../middleware/AWS");
+const path = require("path");
+const fs = require("fs");
+
+// Helper function to save uploaded file locally
+const saveFileLocally = (file, folder) => {
+  const uploadsDir = path.join(__dirname, "../../uploads", folder);
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+  const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+  const ext = path.extname(file.originalname);
+  const filename = `${path.basename(file.originalname, ext)}-${uniqueSuffix}${ext}`;
+  const filepath = path.join(uploadsDir, filename);
+  fs.writeFileSync(filepath, file.buffer);
+  return `/uploads/${folder}/${filename}`;
+};
 
 // @desc    Create new member (Admin only)
 // @route   POST /api/v1/hotel/member/create
@@ -202,8 +217,8 @@ const uploadDocument = asyncHandler(async (req, res) => {
     throw new Error("Member not found");
   }
 
-  // Upload to S3
-  const fileUrl = await uploadFile2(req.file, "documents");
+  // Save file locally
+  const fileUrl = saveFileLocally(req.file, "documents");
 
   // Update member document
   member.documents[documentType] = fileUrl;
@@ -262,6 +277,38 @@ const scanMemberQR = asyncHandler(async (req, res) => {
   });
 });
 
+// @desc    Upload member photo
+// @route   POST /api/v1/hotel/member/upload-photo
+// @access  Private/Admin
+const uploadPhoto = asyncHandler(async (req, res) => {
+  const { memberId } = req.body;
+
+  if (!memberId || !req.file) {
+    res.status(400);
+    throw new Error("Please provide memberId and photo file");
+  }
+
+  const member = await Member.findById(memberId);
+
+  if (!member) {
+    res.status(404);
+    throw new Error("Member not found");
+  }
+
+  // Save photo locally
+  const photoUrl = saveFileLocally(req.file, "profile");
+
+  // Update member profile image
+  member.profileImage = photoUrl;
+  await member.save();
+
+  res.json({
+    success: true,
+    message: "Photo uploaded successfully",
+    photoUrl: photoUrl,
+  });
+});
+
 module.exports = {
   createMember,
   getAllMembers,
@@ -269,5 +316,6 @@ module.exports = {
   updateMember,
   deleteMember,
   uploadDocument,
+  uploadPhoto,
   scanMemberQR,
 };

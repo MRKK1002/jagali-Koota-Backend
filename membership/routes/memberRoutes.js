@@ -8,6 +8,7 @@ const {
   updateMember,
   deleteMember,
   uploadDocument,
+  uploadPhoto,
   scanMemberQR,
 } = require("../controllers/memberController");
 
@@ -22,6 +23,7 @@ router.get("/:id", getMemberById);
 router.put("/:id", updateMember);
 router.delete("/:id", deleteMember);
 router.post("/upload-document", upload.single("document"), uploadDocument);
+router.post("/upload-photo", upload.single("photo"), uploadPhoto);
 
 // QR scan route (for counter/staff)
 router.post("/scan-qr", scanMemberQR);
