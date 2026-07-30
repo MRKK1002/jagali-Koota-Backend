@@ -205,9 +205,9 @@ const uploadDocument = asyncHandler(async (req, res) => {
     throw new Error("Please provide memberId, documentType, and file");
   }
 
-  if (!["aadhar", "passport", "pan"].includes(documentType)) {
+  if (!["aadhar", "passport", "pan", "profilePhoto"].includes(documentType)) {
     res.status(400);
-    throw new Error("Document type must be 'aadhar', 'passport', or 'pan'");
+    throw new Error("Document type must be 'aadhar', 'passport', 'pan', or 'profilePhoto'");
   }
 
   const member = await Member.findById(memberId);
@@ -218,10 +218,14 @@ const uploadDocument = asyncHandler(async (req, res) => {
   }
 
   // Save file locally
-  const fileUrl = saveFileLocally(req.file, "documents");
+  const fileUrl = saveFileLocally(req.file, documentType === "profilePhoto" ? "profile" : "documents");
 
-  // Update member document
-  member.documents[documentType] = fileUrl;
+  // Update member document or profile image
+  if (documentType === "profilePhoto") {
+    member.profileImage = fileUrl;
+  } else {
+    member.documents[documentType] = fileUrl;
+  }
   await member.save();
 
   res.json({
