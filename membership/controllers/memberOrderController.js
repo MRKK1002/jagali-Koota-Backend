@@ -5,22 +5,20 @@ const Member = require("../models/Member");
 const StaffOrder = require("../../model/staffOrderModel");
 const KotCounter = require("../../model/kotCounterModel");
 const Branch = require("../../model/Branch");
+const Table = require("../../model/Table");
 
 // ─────────────────────────────────────────────────────────────
 // Helper: create a KOT (StaffOrder) for a member order
 // ─────────────────────────────────────────────────────────────
 const createKOTForMemberOrder = async (memberOrder, member) => {
   try {
-    // Find a default branch if branchId not provided
+    // Resolve branch
     let branchId = memberOrder.branchId;
     let branchName = memberOrder.branchName || "Jagali Koota";
 
     if (!branchId) {
       const branch = await Branch.findOne({});
-      if (branch) {
-        branchId = branch._id;
-        branchName = branch.name;
-      }
+      if (branch) { branchId = branch._id; branchName = branch.name; }
     } else {
       const branch = await Branch.findById(branchId);
       if (branch) branchName = branch.name;
@@ -29,6 +27,16 @@ const createKOTForMemberOrder = async (memberOrder, member) => {
     if (!branchId) {
       console.error("❌ No branch found for KOT creation");
       return null;
+    }
+
+    // Reserve the table if provided
+    const tableNumber = memberOrder.tableNumber || "Member App";
+    if (memberOrder.tableId) {
+      await Table.findByIdAndUpdate(
+        memberOrder.tableId,
+        { status: "reserved" },
+        { new: true }
+      ).catch(e => console.warn("⚠️ Table reserve failed:", e.message));
     }
 
     // Generate KOT number
@@ -52,12 +60,13 @@ const createKOTForMemberOrder = async (memberOrder, member) => {
     const grandTotal = subtotal + tax + serviceCharge;
 
     const kot = new StaffOrder({
-      orderId: `MBR-${Date.now()}`, // temp, will be replaced by pre-save
+      orderId: `MBR-${Date.now()}`,
       branchId,
       branchName,
       customerName: member.name,
       customerMobile: member.phone || "0000000000",
-      tableNumber: "Member App",
+      tableId: memberOrder.tableId || null,
+      tableNumber,
       peopleCount: 1,
       items: orderItems,
       subtotal,
@@ -69,8 +78,8 @@ const createKOTForMemberOrder = async (memberOrder, member) => {
       paymentStatus: "pending",
       status: "pending",
       orderTime: new Date(),
-      notes: `Member Order: ${memberOrder.orderNumber} | Member: ${member.memberNumber}`,
-      isGuestOrder: true,  // use guest flow (no staffLogin userId needed)
+      notes: `Member Order: ${memberOrder.orderNumber} | Member No: ${member.memberNumber}`,
+      isGuestOrder: true,
       kotNumber,
       kotCounter: 1,
       kots: [{
@@ -90,10 +99,9 @@ const createKOTForMemberOrder = async (memberOrder, member) => {
       branchName,
     });
 
-    console.log(`✅ KOT ${kotNumber} created for member order ${memberOrder.orderNumber}`);
+    console.log(`✅ KOT ${kotNumber} created for member order ${memberOrder.orderNumber}, table ${tableNumber}`);
     return kot;
   } catch (err) {
-    // KOT failure must NOT fail the order placement
     console.error("⚠️ KOT creation failed (non-blocking):", err.message);
     return null;
   }
@@ -105,12 +113,21 @@ const createKOTForMemberOrder = async (memberOrder, member) => {
 // @access  Private (Member)
 // ─────────────────────────────────────────────────────────────
 const placeOrder = asyncHandler(async (req, res) => {
-  const { items, totalAmount, notes, branchId } = req.body;
+  const { items, notes, branchId, tableId, tableNumber } = req.body;
+  let { totalAmount } = req.body;
   const memberId = req.member._id;
 
   if (!items || items.length === 0) {
     res.status(400);
     throw new Error("Please provide items to order");
+  }
+
+  // Calculate totalAmount from items if not provided
+  if (!totalAmount || totalAmount === 0) {
+    totalAmount = items.reduce(
+      (sum, item) => sum + item.price * item.quantity,
+      0
+    );
   }
 
   const member = await Member.findById(memberId);
@@ -123,7 +140,7 @@ const placeOrder = asyncHandler(async (req, res) => {
   if (member.walletBalance < totalAmount) {
     res.status(400);
     throw new Error(
-      `Insufficient wallet balance. You have ₹${member.walletBalance}, order total is ₹${totalAmount}`
+      `Insufficient wallet balance. You have ₹${member.walletBalance.toFixed(2)}, order total is ₹${totalAmount.toFixed(2)}`
     );
   }
 
@@ -141,6 +158,8 @@ const placeOrder = asyncHandler(async (req, res) => {
     memberName: member.name,
     memberPhone: member.phone || "",
     branchId: branchId || null,
+    tableId: tableId || null,
+    tableNumber: tableNumber || null,
     items: formattedItems,
     totalAmount,
     notes: notes || "",
@@ -152,7 +171,7 @@ const placeOrder = asyncHandler(async (req, res) => {
 
   res.status(201).json({
     success: true,
-    message: "Order placed successfully! Your order is being prepared.",
+    message: `Order placed for Table ${tableNumber || "N/A"}! Your order is being prepared.`,
     data: order,
   });
 });
@@ -194,7 +213,7 @@ const getAllOrders = asyncHandler(async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// @desc    Complete order — deduct wallet automatically
+// @desc    Complete order — deduct wallet + free table
 // @route   PUT /api/v1/hotel/member-orders/:id/complete
 // @access  Private (Admin)
 // ─────────────────────────────────────────────────────────────
@@ -221,7 +240,7 @@ const completeOrder = asyncHandler(async (req, res) => {
   if (member.walletBalance < order.totalAmount) {
     res.status(400);
     throw new Error(
-      `Insufficient wallet balance. Current: ₹${member.walletBalance}, Required: ₹${order.totalAmount}`
+      `Insufficient wallet balance. Current: ₹${member.walletBalance.toFixed(2)}, Required: ₹${order.totalAmount.toFixed(2)}`
     );
   }
 
@@ -234,19 +253,26 @@ const completeOrder = asyncHandler(async (req, res) => {
   order.completedAt = new Date();
   await order.save();
 
-  // Also mark the linked KOT as completed if it exists
+  // Free the table
+  if (order.tableId) {
+    await Table.findByIdAndUpdate(
+      order.tableId,
+      { status: "available" },
+      { new: true }
+    ).catch(e => console.warn("⚠️ Table free failed:", e.message));
+  }
+
+  // Sync linked KOT
   if (order.kotNumber) {
     await StaffOrder.findOneAndUpdate(
       { kotNumber: order.kotNumber },
       { status: "completed", paymentStatus: "completed" }
-    ).catch((e) =>
-      console.error("⚠️ KOT status update failed (non-blocking):", e.message)
-    );
+    ).catch((e) => console.error("⚠️ KOT sync failed:", e.message));
   }
 
   res.status(200).json({
     success: true,
-    message: `Order completed! ₹${order.totalAmount} deducted from wallet.`,
+    message: `Order completed! ₹${order.totalAmount.toFixed(2)} deducted from wallet.`,
     data: order,
     remainingBalance: member.walletBalance,
   });
@@ -278,27 +304,19 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
   if (status === "cancelled") order.cancelledAt = new Date();
   await order.save();
 
-  // Sync KOT status
+  // Sync KOT
   if (order.kotNumber) {
-    const kotStatus =
-      status === "completed"
-        ? "completed"
-        : status === "cancelled"
-        ? "cancelled"
-        : status === "processing"
-        ? "preparing"
-        : "pending";
-
+    const kotStatus = status === "completed" ? "completed"
+      : status === "cancelled" ? "cancelled"
+      : status === "processing" ? "preparing"
+      : "pending";
     await StaffOrder.findOneAndUpdate(
       { kotNumber: order.kotNumber },
       { status: kotStatus }
     ).catch(() => {});
   }
 
-  res.status(200).json({
-    success: true,
-    data: order,
-  });
+  res.status(200).json({ success: true, data: order });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -329,6 +347,14 @@ const cancelOrder = asyncHandler(async (req, res) => {
   order.status = "cancelled";
   order.cancelledAt = new Date();
   await order.save();
+
+  // Free the table
+  if (order.tableId) {
+    await Table.findByIdAndUpdate(
+      order.tableId,
+      { status: "available" }
+    ).catch(() => {});
+  }
 
   // Cancel linked KOT
   if (order.kotNumber) {

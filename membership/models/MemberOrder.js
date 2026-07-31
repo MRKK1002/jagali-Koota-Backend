@@ -30,6 +30,15 @@ const memberOrderSchema = new mongoose.Schema(
       type: String,
       default: "Jagali Koota",
     },
+    tableId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Table",
+      default: null,
+    },
+    tableNumber: {
+      type: String,
+      default: null,
+    },
     kotNumber: {
       type: String,
       default: null,
