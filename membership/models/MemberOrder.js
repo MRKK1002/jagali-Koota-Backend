@@ -8,10 +8,31 @@ const memberOrderSchema = new mongoose.Schema(
       required: [true, "Member ID is required"],
       index: true,
     },
+    memberName: {
+      type: String,
+      default: "",
+    },
+    memberPhone: {
+      type: String,
+      default: "",
+    },
     orderNumber: {
       type: String,
       unique: true,
       index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Branch",
+      default: null,
+    },
+    branchName: {
+      type: String,
+      default: "Jagali Koota",
+    },
+    kotNumber: {
+      type: String,
+      default: null,
     },
     items: [
       {
