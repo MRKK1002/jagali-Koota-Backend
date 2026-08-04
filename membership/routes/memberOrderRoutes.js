@@ -7,18 +7,22 @@ const {
   completeOrder,
   updateOrderStatus,
   cancelOrder,
+  addItems,
+  clearAllOrders,
 } = require("../controllers/memberOrderController");
 const { protectMember } = require("../middleware/memberAuth");
-const authMiddleware = require("../../middleware/authMiddleware"); // Admin auth
+const authMiddleware = require("../../middleware/authMiddleware"); 
 
 // Member routes
-router.post("/", protectMember, placeOrder); // Place order
-router.get("/my-orders", protectMember, getMyOrders); // Get my orders
-router.put("/:id/cancel", protectMember, cancelOrder); // Cancel order
+router.post("/", protectMember, placeOrder);                     
+router.get("/my-orders", protectMember, getMyOrders);            
+router.put("/:id/cancel", protectMember, cancelOrder);          
+router.put("/:id/add-items", protectMember, addItems);
+router.delete("/clear-all", protectMember, clearAllOrders); // Clear all orders (testing)
 
 // Admin routes
-router.get("/all", authMiddleware, getAllOrders); // Get all orders
-router.put("/:id/complete", authMiddleware, completeOrder); // Complete order & deduct wallet
-router.put("/:id/status", authMiddleware, updateOrderStatus); // Update order status
+router.get("/all", authMiddleware, getAllOrders); 
+router.put("/:id/complete", authMiddleware, completeOrder); 
+router.put("/:id/status", authMiddleware, updateOrderStatus); 
 
 module.exports = router;

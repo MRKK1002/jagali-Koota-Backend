@@ -371,6 +371,165 @@ const cancelOrder = asyncHandler(async (req, res) => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────
+// @desc    Add more items to an existing pending order (new KOT)
+// @route   PUT /api/v1/hotel/member-orders/:id/add-items
+// @access  Private (Member)
+// ─────────────────────────────────────────────────────────────
+const addItems = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { items } = req.body;
+  const memberId = req.member._id;
+
+  if (!items || items.length === 0) {
+    res.status(400);
+    throw new Error("Please provide items to add");
+  }
+
+  const order = await MemberOrder.findById(id);
+  if (!order) {
+    res.status(404);
+    throw new Error("Order not found");
+  }
+
+  if (order.memberId.toString() !== memberId.toString()) {
+    res.status(403);
+    throw new Error("Not authorized");
+  }
+
+  if (!["pending", "processing"].includes(order.status)) {
+    res.status(400);
+    throw new Error("Can only add items to pending or processing orders");
+  }
+
+  const member = await Member.findById(memberId);
+  if (!member) {
+    res.status(404);
+    throw new Error("Member not found");
+  }
+
+  // Calculate new items total
+  const addedTotal = items.reduce(
+    (sum, item) => sum + item.price * item.quantity,
+    0
+  );
+
+  // Check wallet can cover the new total
+  const newTotal = order.totalAmount + addedTotal;
+  if (member.walletBalance < newTotal) {
+    res.status(400);
+    throw new Error(
+      `Insufficient wallet balance. You have ₹${member.walletBalance.toFixed(2)}, new total would be ₹${newTotal.toFixed(2)}`
+    );
+  }
+
+  // Format and append new items
+  const formattedNew = items.map((item) => ({
+    itemId: item._id || item.itemId || item.menuItemId || null,
+    name: item.name,
+    price: item.price,
+    quantity: item.quantity,
+    subtotal: item.price * item.quantity,
+  }));
+
+  order.items.push(...formattedNew);
+  order.totalAmount = newTotal;
+  await order.save();
+
+  // Create a NEW KOT for only the new items — non-blocking
+  try {
+    let branchId = order.branchId;
+    let branchName = order.branchName || "Jagali Koota";
+
+    if (!branchId) {
+      const branch = await Branch.findOne({});
+      if (branch) { branchId = branch._id; branchName = branch.name; }
+    } else {
+      const branch = await Branch.findById(branchId);
+      if (branch) branchName = branch.name;
+    }
+
+    if (branchId) {
+      const kotNumber = await KotCounter.getNextKotNumber(branchId);
+
+      const kotItems = items.map((item) => ({
+        menuItemId: item._id || item.itemId || item.menuItemId
+          ? String(item._id || item.itemId || item.menuItemId)
+          : new mongoose.Types.ObjectId().toString(),
+        name: item.name,
+        price: item.price,
+        quantity: item.quantity,
+        kotNumber,
+        isNewItem: true,
+      }));
+
+      const subtotal = addedTotal;
+      const tax = subtotal * 0.05;
+      const serviceCharge = subtotal * 0.1;
+
+      const newKot = new StaffOrder({
+        orderId: `MBR-ADD-${Date.now()}`,
+        branchId,
+        branchName,
+        customerName: member.name,
+        customerMobile: member.phone || "0000000000",
+        tableId: order.tableId || null,
+        tableNumber: order.tableNumber || "Member App",
+        peopleCount: 1,
+        items: kotItems,
+        subtotal,
+        tax,
+        serviceCharge,
+        totalAmount: subtotal,
+        grandTotal: subtotal + tax + serviceCharge,
+        paymentMethod: "wallet",
+        paymentStatus: "pending",
+        status: "pending",
+        orderTime: new Date(),
+        notes: `Add-on to Member Order: ${order.orderNumber} | Member: ${member.memberNumber}`,
+        isGuestOrder: true,
+        kotNumber,
+        kotCounter: 1,
+        kots: [{
+          kotNumber,
+          items: items.map((i) => i.name),
+          generatedAt: new Date(),
+          itemCount: items.reduce((s, i) => s + i.quantity, 0),
+        }],
+      });
+
+      await newKot.save();
+      console.log(`✅ Add-on KOT ${kotNumber} created for order ${order.orderNumber}, table ${order.tableNumber}`);
+    }
+  } catch (err) {
+    console.error("⚠️ Add-on KOT creation failed (non-blocking):", err.message);
+  }
+
+  res.status(200).json({
+    success: true,
+    message: `${items.length} item(s) added to your order and sent to kitchen.`,
+    data: order,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// @desc    Clear all orders for a member (Testing/Development)
+// @route   DELETE /api/v1/hotel/member-orders/clear-all
+// @access  Private (Member)
+// ─────────────────────────────────────────────────────────────
+const clearAllOrders = asyncHandler(async (req, res) => {
+  const memberId = req.member._id;
+
+  // Delete all orders for this member
+  const result = await MemberOrder.deleteMany({ memberId });
+
+  res.status(200).json({
+    success: true,
+    message: `${result.deletedCount} order(s) have been cleared`,
+    deletedCount: result.deletedCount,
+  });
+});
+
 module.exports = {
   placeOrder,
   getMyOrders,
@@ -378,4 +537,6 @@ module.exports = {
   completeOrder,
   updateOrderStatus,
   cancelOrder,
+  addItems,
+  clearAllOrders,
 };
