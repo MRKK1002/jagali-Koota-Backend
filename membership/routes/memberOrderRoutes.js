@@ -8,7 +8,6 @@ const {
   updateOrderStatus,
   cancelOrder,
   addItems,
-  clearAllOrders,
 } = require("../controllers/memberOrderController");
 const { protectMember } = require("../middleware/memberAuth");
 const authMiddleware = require("../../middleware/authMiddleware"); 
@@ -17,8 +16,7 @@ const authMiddleware = require("../../middleware/authMiddleware");
 router.post("/", protectMember, placeOrder);                     
 router.get("/my-orders", protectMember, getMyOrders);            
 router.put("/:id/cancel", protectMember, cancelOrder);          
-router.put("/:id/add-items", protectMember, addItems);
-router.delete("/clear-all", protectMember, clearAllOrders); // Clear all orders (testing)
+router.put("/:id/add-items", protectMember, addItems);         
 
 // Admin routes
 router.get("/all", authMiddleware, getAllOrders); 

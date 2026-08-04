@@ -512,24 +512,6 @@ const addItems = asyncHandler(async (req, res) => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────
-// @desc    Clear all orders for a member (Testing/Development)
-// @route   DELETE /api/v1/hotel/member-orders/clear-all
-// @access  Private (Member)
-// ─────────────────────────────────────────────────────────────
-const clearAllOrders = asyncHandler(async (req, res) => {
-  const memberId = req.member._id;
-
-  // Delete all orders for this member
-  const result = await MemberOrder.deleteMany({ memberId });
-
-  res.status(200).json({
-    success: true,
-    message: `${result.deletedCount} order(s) have been cleared`,
-    deletedCount: result.deletedCount,
-  });
-});
-
 module.exports = {
   placeOrder,
   getMyOrders,
@@ -538,5 +520,4 @@ module.exports = {
   updateOrderStatus,
   cancelOrder,
   addItems,
-  clearAllOrders,
 };
