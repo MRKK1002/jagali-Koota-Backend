@@ -32,7 +32,7 @@ const deleteImageFile = (imagePath) => {
 // @route   POST /api/v1/hotel/gallery/upload
 // @access  Private/Admin
 const uploadGalleryImages = asyncHandler(async (req, res) => {
-  const { title, category, description, displayOrder } = req.body;
+  const { title, description } = req.body;
 
   if (!req.files || req.files.length === 0) {
     res.status(400);
@@ -55,9 +55,7 @@ const uploadGalleryImages = asyncHandler(async (req, res) => {
       const item = await Gallery.create({
         title: itemTitle,
         image: imagePath,
-        category: category || "Food",
         description: description || "",
-        displayOrder: Number(displayOrder) || 0,
         createdBy: req.admin?.id || req.user?.id || null,
       });
 
@@ -84,7 +82,7 @@ const uploadGalleryImages = asyncHandler(async (req, res) => {
 // @route   GET /api/v1/hotel/gallery/all
 // @access  Public
 const getAllGalleryImages = asyncHandler(async (req, res) => {
-  const { category, includeInactive, limit = 200 } = req.query;
+  const { includeInactive, limit = 200 } = req.query;
 
   const query = {};
 
@@ -93,21 +91,13 @@ const getAllGalleryImages = asyncHandler(async (req, res) => {
     query.isActive = true;
   }
 
-  if (category && category !== "All") {
-    query.category = category;
-  }
-
   const images = await Gallery.find(query)
-    .sort({ displayOrder: 1, createdAt: -1 })
+    .sort({ createdAt: -1 })
     .limit(Number(limit));
-
-  // Distinct categories present in active images — lets the app build its filter bar
-  const categories = await Gallery.distinct("category", { isActive: true });
 
   res.json({
     success: true,
     count: images.length,
-    categories,
     images,
   });
 });
@@ -116,7 +106,7 @@ const getAllGalleryImages = asyncHandler(async (req, res) => {
 // @route   PUT /api/v1/hotel/gallery/:id
 // @access  Private/Admin
 const updateGalleryImage = asyncHandler(async (req, res) => {
-  const { title, category, description, displayOrder, isActive } = req.body;
+  const { title, description, isActive } = req.body;
 
   const item = await Gallery.findById(req.params.id);
 
@@ -126,9 +116,7 @@ const updateGalleryImage = asyncHandler(async (req, res) => {
   }
 
   if (title !== undefined) item.title = title;
-  if (category !== undefined) item.category = category;
   if (description !== undefined) item.description = description;
-  if (displayOrder !== undefined) item.displayOrder = Number(displayOrder) || 0;
   if (isActive !== undefined) item.isActive = isActive === true || isActive === "true";
 
   // Replace the image file if a new one was uploaded
