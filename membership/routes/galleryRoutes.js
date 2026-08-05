@@ -5,6 +5,7 @@ const multer = require("multer");
 const {
   uploadGalleryImages,
   getAllGalleryImages,
+  downloadGalleryImage,
   updateGalleryImage,
   deleteGalleryImage,
 } = require("../controllers/galleryController");
@@ -16,8 +17,9 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB per image
 });
 
-// Public route — Member App fetches gallery from here
+// Public routes — Member App fetches gallery and downloads images from here
 router.get("/all", getAllGalleryImages);
+router.get("/:id/download", downloadGalleryImage);
 
 // Admin routes (add admin auth middleware when available)
 router.post("/upload", upload.array("images", 20), uploadGalleryImages);

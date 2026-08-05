@@ -135,6 +135,48 @@ const updateGalleryImage = asyncHandler(async (req, res) => {
   });
 });
 
+// @desc    Download a gallery image as a file attachment
+// @route   GET /api/v1/hotel/gallery/:id/download
+// @access  Public
+// Sends Content-Disposition: attachment so browsers save the file instead of
+// rendering it inline (which is what happens when hitting /uploads/... directly).
+const downloadGalleryImage = asyncHandler(async (req, res) => {
+  const item = await Gallery.findById(req.params.id);
+
+  if (!item) {
+    res.status(404);
+    throw new Error("Gallery image not found");
+  }
+
+  // basename guards against path traversal via a tampered stored value
+  const fileName = path.basename(item.image || "");
+  const filePath = path.join(UPLOAD_DIR, fileName);
+
+  if (!fileName || !fs.existsSync(filePath)) {
+    res.status(404);
+    throw new Error("Image file not found on server");
+  }
+
+  // Friendly filename built from the title, keeping the original extension
+  const ext = path.extname(fileName) || ".jpg";
+  const safeTitle =
+    String(item.title || "gallery-image")
+      .trim()
+      .replace(/[^\w\s\-]/g, "")
+      .replace(/\s+/g, "-")
+      .toLowerCase() || "gallery-image";
+
+  res.download(filePath, `${safeTitle}${ext}`, (err) => {
+    if (err && !res.headersSent) {
+      console.error("Error sending gallery download:", err.message);
+      res.status(500).json({
+        success: false,
+        message: "Failed to download image",
+      });
+    }
+  });
+});
+
 // @desc    Delete gallery image (Admin)
 // @route   DELETE /api/v1/hotel/gallery/:id
 // @access  Private/Admin
@@ -158,6 +200,7 @@ const deleteGalleryImage = asyncHandler(async (req, res) => {
 module.exports = {
   uploadGalleryImages,
   getAllGalleryImages,
+  downloadGalleryImage,
   updateGalleryImage,
   deleteGalleryImage,
 };
