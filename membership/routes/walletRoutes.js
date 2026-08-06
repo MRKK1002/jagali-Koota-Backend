@@ -167,7 +167,11 @@ router.get("/member-by-order/:orderId", async (req, res) => {
       member = await Member.findById(order.userId);
     }
 
-    if (!member && order.phoneNumber) {
+    // "0000000000" is CartScreen.js's placeholder for a missing phone number,
+    // never a real one — don't use it to look up a member, or an order with
+    // no phone could match whichever member happens to have that placeholder
+    // stored as their number.
+    if (!member && order.phoneNumber && order.phoneNumber !== "0000000000") {
       member = await Member.findOne({ phone: order.phoneNumber });
     }
 

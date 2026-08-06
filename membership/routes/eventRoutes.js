@@ -11,6 +11,7 @@ const {
   bookEvent,
   getMyBookings,
   cancelBooking,
+  addSeatsToBooking,
   getEventBookings,
   getAllBookings,
   updateBookingStatus,
@@ -32,6 +33,7 @@ router.get("/:id", getEventById);
 router.post("/:id/book", protectMember, bookEvent);
 router.get("/my-bookings", protectMember, getMyBookings);
 router.put("/bookings/:id/cancel", protectMember, cancelBooking);
+router.put("/bookings/:id/add-seats", protectMember, addSeatsToBooking);
 
 // Admin routes (add admin auth when available)
 router.post("/create", upload.array("images", 5), createEvent);

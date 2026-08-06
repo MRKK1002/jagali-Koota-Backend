@@ -1,5 +1,13 @@
 const mongoose = require("mongoose");
 
+const guestSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    age:  { type: Number, required: true, min: 1 },
+  },
+  { _id: false }
+);
+
 const eventBookingSchema = new mongoose.Schema(
   {
     eventId: {
@@ -29,6 +37,10 @@ const eventBookingSchema = new mongoose.Schema(
       required: true,
       min: 1,
     },
+    guests: {
+      type: [guestSchema],
+      default: [],
+    },
     pricePerPerson: {
       type: Number,
       required: true,
@@ -51,6 +63,10 @@ const eventBookingSchema = new mongoose.Schema(
       type: String,
       enum: ["wallet", "cash", "card", "upi", "other"],
       default: "other",
+    },
+    walletDeducted: {
+      type: Boolean,
+      default: false,
     },
     notes: {
       type: String,

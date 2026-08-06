@@ -1,7 +1,12 @@
 const asyncHandler = require("express-async-handler");
 const Event = require("../models/Event");
 const EventBooking = require("../models/EventBooking");
+const WalletTransaction = require("../models/WalletTransaction");
+const Member = require("../models/Member");
 const { uploadFile2 } = require("../../middleware/AWS");
+
+// Number of days before event that cancellation is blocked
+const CANCEL_CUTOFF_DAYS = 2;
 
 // @desc    Create event (Admin only)
 // @route   POST /api/v1/hotel/events/create
@@ -270,11 +275,25 @@ const bookEvent = asyncHandler(async (req, res) => {
   console.log('Request body:', req.body);
   console.log('Member:', req.member?._id, req.member?.name);
   
-  const { numberOfPeople, notes } = req.body;
+  const { numberOfPeople, notes, paymentMethod, guests } = req.body;
 
   if (!numberOfPeople || numberOfPeople < 1) {
     res.status(400);
     throw new Error("Please provide valid number of people");
+  }
+
+  // Validate guests array if provided
+  if (guests && Array.isArray(guests)) {
+    for (const g of guests) {
+      if (!g.name || !g.name.trim()) {
+        res.status(400);
+        throw new Error("Each guest must have a name");
+      }
+      if (!g.age || g.age < 1) {
+        res.status(400);
+        throw new Error("Each guest must have a valid age");
+      }
+    }
   }
 
   const event = await Event.findById(req.params.id);
@@ -319,6 +338,31 @@ const bookEvent = asyncHandler(async (req, res) => {
   }
 
   const totalAmount = event.pricePerPerson * numberOfPeople;
+  const useWallet = paymentMethod === "wallet";
+  let walletDeducted = false;
+
+  // Wallet deduction
+  if (useWallet && totalAmount > 0) {
+    const member = await Member.findById(req.member._id);
+    if (!member) {
+      res.status(404);
+      throw new Error("Member not found");
+    }
+    if (member.walletBalance < totalAmount) {
+      res.status(400);
+      throw new Error(
+        `Insufficient wallet balance. Available: ₹${member.walletBalance}, Required: ₹${totalAmount}`
+      );
+    }
+    await WalletTransaction.createTransaction({
+      memberId: member._id,
+      type: "debit",
+      amount: totalAmount,
+      description: `Event booking: ${event.title}`,
+      createdBy: "member",
+    });
+    walletDeducted = true;
+  }
 
   // Create booking
   const booking = await EventBooking.create({
@@ -328,8 +372,12 @@ const bookEvent = asyncHandler(async (req, res) => {
     memberEmail: req.member.email || "",
     memberPhone: req.member.phone || req.member.mobile || "",
     numberOfPeople,
+    guests: guests && Array.isArray(guests) ? guests : [],
     pricePerPerson: event.pricePerPerson,
     totalAmount,
+    paymentMethod: useWallet ? "wallet" : (paymentMethod || "other"),
+    paymentStatus: useWallet ? "paid" : "pending",
+    walletDeducted,
     notes: notes || "",
   });
 
@@ -366,7 +414,7 @@ const getMyBookings = asyncHandler(async (req, res) => {
 const cancelBooking = asyncHandler(async (req, res) => {
   const { cancelReason } = req.body;
 
-  const booking = await EventBooking.findById(req.params.id);
+  const booking = await EventBooking.findById(req.params.id).populate("eventId");
 
   if (!booking) {
     res.status(404);
@@ -383,21 +431,52 @@ const cancelBooking = asyncHandler(async (req, res) => {
     throw new Error("Booking already cancelled");
   }
 
+  // 2-day cancellation cutoff
+  const event = booking.eventId; // populated
+  if (event) {
+    const eventDate = new Date(event.eventDate);
+    const cutoff = new Date(eventDate);
+    cutoff.setDate(cutoff.getDate() - CANCEL_CUTOFF_DAYS);
+    if (new Date() >= cutoff) {
+      res.status(400);
+      throw new Error(
+        `Cancellations are not allowed within ${CANCEL_CUTOFF_DAYS} days of the event`
+      );
+    }
+  }
+
+  // Wallet refund if originally deducted
+  let refunded = false;
+  if (booking.walletDeducted && booking.totalAmount > 0) {
+    await WalletTransaction.createTransaction({
+      memberId: booking.memberId,
+      type: "credit",
+      amount: booking.totalAmount,
+      description: `Refund: cancelled event booking — ${event?.title || "Event"}`,
+      createdBy: "system",
+    });
+    booking.paymentStatus = "refunded";
+    refunded = true;
+  }
+
   booking.status = "cancelled";
   booking.cancelledAt = new Date();
   booking.cancelReason = cancelReason || "";
   await booking.save();
 
   // Update event total booked
-  const event = await Event.findById(booking.eventId);
-  if (event) {
+  if (event && event.save) {
     event.totalBooked = Math.max(0, event.totalBooked - booking.numberOfPeople);
     await event.save();
   }
 
   res.json({
     success: true,
-    message: "Booking cancelled successfully",
+    message: refunded
+      ? `Booking cancelled and ₹${booking.totalAmount} refunded to your wallet`
+      : "Booking cancelled successfully",
+    refunded,
+    refundAmount: refunded ? booking.totalAmount : 0,
     booking,
   });
 });
@@ -485,6 +564,90 @@ const updateBookingStatus = asyncHandler(async (req, res) => {
   });
 });
 
+// @desc    Add more seats to an existing confirmed booking
+// @route   PUT /api/v1/hotel/events/bookings/:id/add-seats
+// @access  Private/Member
+const addSeatsToBooking = asyncHandler(async (req, res) => {
+  const { extraPeople, paymentMethod, notes } = req.body;
+
+  const extra = parseInt(extraPeople);
+  if (!extra || extra < 1) {
+    res.status(400);
+    throw new Error("Please provide a valid number of extra seats");
+  }
+
+  const booking = await EventBooking.findById(req.params.id).populate("eventId");
+
+  if (!booking) {
+    res.status(404);
+    throw new Error("Booking not found");
+  }
+
+  if (booking.memberId.toString() !== req.member._id.toString()) {
+    res.status(403);
+    throw new Error("Not authorized");
+  }
+
+  if (booking.status !== "confirmed") {
+    res.status(400);
+    throw new Error("Can only add seats to a confirmed booking");
+  }
+
+  const event = booking.eventId;
+
+  // Check available seats
+  if (event.maxBookings) {
+    const available = event.maxBookings - event.totalBooked;
+    if (extra > available) {
+      res.status(400);
+      throw new Error(`Only ${available} seat(s) remaining`);
+    }
+  }
+
+  const extraAmount = event.pricePerPerson * extra;
+  const useWallet = paymentMethod === "wallet";
+
+  // Wallet deduction for extra seats
+  if (useWallet && extraAmount > 0) {
+    const member = await Member.findById(req.member._id);
+    if (!member) {
+      res.status(404);
+      throw new Error("Member not found");
+    }
+    if (member.walletBalance < extraAmount) {
+      res.status(400);
+      throw new Error(
+        `Insufficient wallet balance. Available: ₹${member.walletBalance}, Required: ₹${extraAmount}`
+      );
+    }
+    await WalletTransaction.createTransaction({
+      memberId: member._id,
+      type: "debit",
+      amount: extraAmount,
+      description: `Extra seats for event: ${event.title}`,
+      createdBy: "member",
+    });
+    // Mark wallet deducted (already true or now true)
+    booking.walletDeducted = true;
+  }
+
+  // Update booking
+  booking.numberOfPeople += extra;
+  booking.totalAmount += extraAmount;
+  if (notes) booking.notes = (booking.notes ? booking.notes + "; " : "") + notes;
+  await booking.save();
+
+  // Update event seat count
+  event.totalBooked += extra;
+  await event.save();
+
+  res.json({
+    success: true,
+    message: `${extra} seat(s) added successfully`,
+    booking,
+  });
+});
+
 module.exports = {
   createEvent,
   getAllEvents,
@@ -495,6 +658,7 @@ module.exports = {
   bookEvent,
   getMyBookings,
   cancelBooking,
+  addSeatsToBooking,
   getEventBookings,
   getAllBookings,
   updateBookingStatus,
