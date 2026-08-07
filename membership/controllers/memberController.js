@@ -246,15 +246,31 @@ const scanMemberQR = asyncHandler(async (req, res) => {
     throw new Error("Please provide QR code data");
   }
 
-  let memberData;
-  try {
-    memberData = JSON.parse(qrData);
-  } catch (error) {
-    res.status(400);
-    throw new Error("Invalid QR code data");
+  let memberId;
+
+  // Support both formats:
+  // 1. URL format: https://billing.jagalikoota.com/member/<id>
+  // 2. Legacy JSON format: {"memberId":"...","memberNumber":"...","name":"..."}
+  if (qrData.startsWith("http")) {
+    // Extract member ID from URL (last path segment)
+    const parts = qrData.split("/");
+    memberId = parts[parts.length - 1];
+  } else {
+    try {
+      const parsed = JSON.parse(qrData);
+      memberId = parsed.memberId;
+    } catch (error) {
+      res.status(400);
+      throw new Error("Invalid QR code data");
+    }
   }
 
-  const member = await Member.findById(memberData.memberId);
+  if (!memberId) {
+    res.status(400);
+    throw new Error("Could not extract member ID from QR code");
+  }
+
+  const member = await Member.findById(memberId);
 
   if (!member) {
     res.status(404);
