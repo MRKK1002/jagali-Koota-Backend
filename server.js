@@ -174,6 +174,7 @@ const eventRoutes = require("./membership/routes/eventRoutes");
 const feedbackRoutes = require("./membership/routes/feedbackRoutes");
 const memberOrderRoutes = require("./membership/routes/memberOrderRoutes");
 const galleryRoutes = require("./membership/routes/galleryRoutes");
+const blacklistRoutes = require("./membership/routes/blacklistRoutes");
 const salesReportRoutes = require("./routes/salesReportRoutes");
 // hotel Routes — active
 app.use("/api/v1/hotel/user-auth", userRoutes);
@@ -238,6 +239,7 @@ app.use("/api/v1/hotel/events", eventRoutes);
 app.use("/api/v1/hotel/feedback", feedbackRoutes);
 app.use("/api/v1/hotel/member-orders", memberOrderRoutes);
 app.use("/api/v1/hotel/gallery", galleryRoutes);
+app.use("/api/v1/hotel/blacklist", blacklistRoutes);
 app.use("/api/v1/hotel/sales-report", salesReportRoutes);
 
 // Bill Reset Routes
