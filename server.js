@@ -41,7 +41,7 @@ app.options('*', cors());
 //           "data:",
 //           "http://localhost:3000",
 //           "http://localhost:5173",
-//           "http://localhost:9000",
+//           "https://billing.jagalikoota.com",
 //           "https://hotelvirat.s3.amazonaws.com"
 //         ],
 //       },
@@ -316,9 +316,25 @@ app.use((err, req, res, next) => {
 // Define Port
 const PORT = process.env.PORT || 9000;
 // Start the server
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server is running on port ${PORT}`);
   console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🌐 Server accessible at: http://0.0.0.0:${PORT}`);
   console.log(`⏰ Started at: ${new Date().toLocaleString()}`);
 });
+
+// ─── Socket.IO for real-time KOT notifications ─────────────────────────────
+const { Server: SocketServer } = require('socket.io');
+const io = new SocketServer(server, {
+  cors: { origin: true, methods: ['GET', 'POST'] }
+});
+
+io.on('connection', (socket) => {
+  console.log('🔌 Socket connected:', socket.id);
+  socket.on('disconnect', () => {
+    console.log('🔌 Socket disconnected:', socket.id);
+  });
+});
+
+// Export io so controllers can emit events
+app.set('io', io);

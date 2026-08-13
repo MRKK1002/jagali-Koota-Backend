@@ -7,6 +7,35 @@ const asyncHandler = require("express-async-handler")
 const Recipe = require("../model/recipe")
 const RawMaterial = require("../model/rawMaterialModel")
 
+// ─── In-Memory Cache for GET orders (60s TTL) ──────────────────────────────
+// Only caches READ responses. Invalidated on any write (create/update/cancel).
+const orderCache = new Map()
+const CACHE_TTL = 60 * 1000 // 60 seconds
+
+function getCachedResponse(key) {
+  const entry = orderCache.get(key)
+  if (!entry) return null
+  if (Date.now() - entry.timestamp > CACHE_TTL) {
+    orderCache.delete(key)
+    return null
+  }
+  return entry.data
+}
+
+function setCachedResponse(key, data) {
+  // Limit cache size to prevent memory leaks (max 50 entries)
+  if (orderCache.size > 50) {
+    const oldest = orderCache.keys().next().value
+    orderCache.delete(oldest)
+  }
+  orderCache.set(key, { data, timestamp: Date.now() })
+}
+
+function invalidateOrderCache() {
+  orderCache.clear()
+}
+// ─── End Cache ──────────────────────────────────────────────────────────────
+
 /**
  * Auto-deduct raw material stock based on recipe ingredients.
  * Each menu item can have a Recipe linked via menuItemId.
@@ -202,10 +231,10 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
     serverName: req.body.serverName || null, // Server/Waiter name
     kotNumber: req.body.kotNumber || null,
     kotTime: req.body.kotTime || null,
-    invoiceNumber: req.body.invoiceNumber || null, // Add invoiceNumber field
+    invoiceNumber: req.body.invoiceNumber || null,
     items,
     subtotal: calculatedSubtotal,
-    gstAmount: providedGstAmount || 0, // ✅ Save GST amount from frontend
+    gstAmount: providedGstAmount || 0,
     tax: finalTax,
     serviceCharge: finalServiceCharge,
     totalAmount: finalTotalAmount,
@@ -244,6 +273,32 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
   }
   
   console.log('[createCounterOrder] Saved successfully:', counterOrder.invoiceNumber || counterOrder._id)
+
+  // Invalidate order cache so next GET returns fresh data
+  invalidateOrderCache()
+
+  // Emit real-time notification via Socket.IO (only for pending KOTs, not completed bills)
+  try {
+    const io = req.app.get('io')
+    if (io && counterOrder.paymentStatus === 'pending') {
+      console.log('🔔 Emitting new-kot event via Socket.IO')
+      io.emit('new-kot', {
+        id: counterOrder._id,
+        invoiceNumber: counterOrder.invoiceNumber,
+        tableNumber: counterOrder.tableNumber,
+        customerName: counterOrder.customerName,
+        items: counterOrder.items,
+        branchId: counterOrder.branch,
+        branchName: counterOrder.branchName,
+        categoryName: counterOrder.categoryName,
+        totalAmount: counterOrder.grandTotal || counterOrder.totalAmount,
+        createdAt: counterOrder.createdAt,
+      })
+    } else if (io) {
+      // Completed bill — just notify for list refresh (no ringtone)
+      io.emit('order-updated')
+    }
+  } catch (err) { console.error('Socket emit error:', err.message) }
 
   // Auto-deduct raw material stock based on recipe ingredients (non-blocking)
   deductRawMaterialsForOrder(counterOrder.items).catch((err) =>
@@ -360,6 +415,13 @@ exports.getCounterOrderById = asyncHandler(async (req, res) => {
   })
 })
 exports.getAllCounterOrders = asyncHandler(async (req, res) => {
+  // Check in-memory cache first (only for GET requests)
+  const cacheKey = req.originalUrl || req.url
+  const cached = getCachedResponse(cacheKey)
+  if (cached) {
+    return res.status(200).json(cached)
+  }
+
   const { 
     includeComplimentary = false, 
     startDate, 
@@ -586,7 +648,7 @@ exports.getAllCounterOrders = asyncHandler(async (req, res) => {
 
   // console.log('✅ Returning formatted orders:', formattedOrders.length);
 
-  res.status(200).json({
+  const responseBody = {
     success: true,
     message: "Counter orders retrieved successfully",
     count: formattedOrders.length,
@@ -612,7 +674,12 @@ exports.getAllCounterOrders = asyncHandler(async (req, res) => {
       orderStatus,
       paymentMethod
     }
-  })
+  }
+
+  // Cache the response for subsequent identical requests
+  setCachedResponse(cacheKey, responseBody)
+
+  res.status(200).json(responseBody)
 })
 exports.getCounterOrdersByUserId = asyncHandler(async (req, res) => {
   const { userId } = req.params
@@ -682,6 +749,9 @@ if (!userId.match(/^[0-9a-fA-F]{24}$/)) {
 })
 
 exports.updateCounterOrder = asyncHandler(async (req, res) => {
+  invalidateOrderCache()
+  // Emit order-updated event
+  try { const io = req.app.get('io'); if (io) io.emit('order-updated') } catch (_) {}
   const { id } = req.params
   const updateData = req.body
 
@@ -767,6 +837,9 @@ exports.updateCounterOrder = asyncHandler(async (req, res) => {
 
 // Update order status only
 exports.updateCounterOrderStatus = asyncHandler(async (req, res) => {
+  invalidateOrderCache()
+  // Emit order-updated event
+  try { const io = req.app.get('io'); if (io) io.emit('order-updated') } catch (_) {}
   const { id } = req.params
   const { orderStatus } = req.body
 
@@ -919,6 +992,9 @@ exports.updateCounterPaymentStatus = asyncHandler(async (req, res) => {
 
 // Cancel order with reason
 exports.cancelCounterOrder = asyncHandler(async (req, res) => {
+  invalidateOrderCache()
+  // Emit order-updated event
+  try { const io = req.app.get('io'); if (io) io.emit('order-updated') } catch (_) {}
   const { id } = req.params
   const { cancellationReason, cancelledBy } = req.body
 

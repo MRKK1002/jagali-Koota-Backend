@@ -3,6 +3,34 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 const { uploadFile2, deleteFile } = require('../middleware/AWS');
+
+// ─── In-Memory Cache for menu GET (120s TTL) ───────────────────────────────
+const menuCache = new Map()
+const MENU_CACHE_TTL = 120 * 1000 // 2 minutes (menu changes rarely)
+
+function getMenuCached(key) {
+  const entry = menuCache.get(key)
+  if (!entry) return null
+  if (Date.now() - entry.timestamp > MENU_CACHE_TTL) {
+    menuCache.delete(key)
+    return null
+  }
+  return entry.data
+}
+
+function setMenuCached(key, data) {
+  if (menuCache.size > 30) {
+    const oldest = menuCache.keys().next().value
+    menuCache.delete(oldest)
+  }
+  menuCache.set(key, { data, timestamp: Date.now() })
+}
+
+function invalidateMenuCache() {
+  menuCache.clear()
+}
+// ─── End Cache ──────────────────────────────────────────────────────────────
+
 exports.createMenuItem = async (req, res) => {
   try {
     const { 
@@ -154,6 +182,7 @@ exports.createMenuItem = async (req, res) => {
     const menuItem = new Menu(menuItemData);
 
     await menuItem.save();
+    invalidateMenuCache()
     res.status(201).json({ message: 'Menu item created successfully', menuItem });
   } catch (error) {
     console.error('Error creating menu item:', error);
@@ -167,6 +196,13 @@ exports.createMenuItem = async (req, res) => {
 };
 exports.getAllMenuItems = async (req, res) => {
   try {
+    // Check menu cache first
+    const cacheKey = req.originalUrl || req.url
+    const cached = getMenuCached(cacheKey)
+    if (cached) {
+      return res.status(200).json(cached)
+    }
+
     const { 
       categoryId, 
       subcategoryId, 
@@ -306,7 +342,7 @@ exports.getAllMenuItems = async (req, res) => {
     const branchCountsMap = {};
     branchCounts.forEach(c => { if (c._id) branchCountsMap[c._id.toString()] = c.count; });
 
-    res.status(200).json({
+    const responseBody = {
       success: true,
       data: menuItems,
       pagination: {
@@ -329,7 +365,12 @@ exports.getAllMenuItems = async (req, res) => {
         endDate,
         isActive
       }
-    });
+    };
+
+    // Cache the response
+    setMenuCached(cacheKey, responseBody)
+
+    res.status(200).json(responseBody);
   } catch (error) {
     console.error('Error fetching menu items:', error);
     res.status(500).json({ 
@@ -512,6 +553,7 @@ exports.updateMenuItem = async (req, res) => {
     }
 
     res.status(200).json({ message: 'Menu item updated successfully', menuItem });
+    invalidateMenuCache()
   } catch (error) {
     console.error('Error updating menu item:', error);
     console.error('Error details:', {
@@ -536,6 +578,7 @@ exports.deleteMenuItem = async (req, res) => {
     }
 
     await Menu.findByIdAndDelete(req.params.id);
+    invalidateMenuCache()
     res.status(200).json({ message: 'Menu item deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: 'Error deleting menu item', error: error.message });
