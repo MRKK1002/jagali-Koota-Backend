@@ -1,4 +1,5 @@
 const Menu = require('../model/menuModel');
+const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 const { uploadFile2, deleteFile } = require('../middleware/AWS');
@@ -248,8 +249,17 @@ exports.getAllMenuItems = async (req, res) => {
     const sort = {};
     sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
     
-    // Execute query with pagination
-    const [menuItems, totalCount] = await Promise.all([
+    // Build a base filter (without categoryId/subcategoryId) for category counts
+    const baseFilter = { ...filter };
+    delete baseFilter.categoryId;
+    delete baseFilter.subcategoryId;
+
+    // Build a filter without any branch/category/subcategory for branch counts
+    const branchBaseFilter = { ...baseFilter };
+    delete branchBaseFilter.branchId;
+
+    // Execute query with pagination + category/subcategory/branch counts
+    const [menuItems, totalCount, categoryCounts, subcategoryCounts, branchCounts] = await Promise.all([
       Menu.find(filter)
         .populate('categoryId', 'name')
         .populate('subcategoryId', 'name')
@@ -259,7 +269,22 @@ exports.getAllMenuItems = async (req, res) => {
         .skip(skip)
         .limit(limitNum)
         .lean(),
-      Menu.countDocuments(filter)
+      Menu.countDocuments(filter),
+      // Count items per category (using base filter without category/subcategory)
+      Menu.aggregate([
+        { $match: baseFilter },
+        { $group: { _id: '$categoryId', count: { $sum: 1 } } }
+      ]),
+      // Count items per subcategory (using filter with categoryId but without subcategoryId)
+      Menu.aggregate([
+        { $match: { ...baseFilter, ...(categoryId ? { categoryId: new mongoose.Types.ObjectId(categoryId) } : {}) } },
+        { $group: { _id: '$subcategoryId', count: { $sum: 1 } } }
+      ]),
+      // Count items per branch (no branch/category/subcategory filter)
+      Menu.aggregate([
+        { $match: branchBaseFilter },
+        { $group: { _id: '$branchId', count: { $sum: 1 } } }
+      ])
     ]);
 
     if (menuItems.length > 0) {
@@ -271,6 +296,16 @@ exports.getAllMenuItems = async (req, res) => {
     const hasNextPage = pageNum < totalPages;
     const hasPrevPage = pageNum > 1;
     
+    // Convert category/subcategory/branch counts to objects { id: count }
+    const categoryCountsMap = {};
+    categoryCounts.forEach(c => { if (c._id) categoryCountsMap[c._id.toString()] = c.count; });
+    
+    const subcategoryCountsMap = {};
+    subcategoryCounts.forEach(c => { if (c._id) subcategoryCountsMap[c._id.toString()] = c.count; });
+
+    const branchCountsMap = {};
+    branchCounts.forEach(c => { if (c._id) branchCountsMap[c._id.toString()] = c.count; });
+
     res.status(200).json({
       success: true,
       data: menuItems,
@@ -282,6 +317,9 @@ exports.getAllMenuItems = async (req, res) => {
         hasNextPage,
         hasPrevPage
       },
+      categoryCounts: categoryCountsMap,
+      subcategoryCounts: subcategoryCountsMap,
+      branchCounts: branchCountsMap,
       filters: {
         categoryId,
         subcategoryId,
