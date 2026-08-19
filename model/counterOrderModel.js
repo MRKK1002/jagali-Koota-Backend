@@ -31,6 +31,13 @@ const cOrderItemSchema = new mongoose.Schema({
     type: Boolean,
     default: false,
   },
+  // Non-chargeable at item level — internal consumption (staff meal, tasting,
+  // wastage). Distinct from complimentary, which is a customer-facing goodwill
+  // give-away. Both cost nothing, but they are accounted differently.
+  isNonChargeable: {
+    type: Boolean,
+    default: false,
+  },
   remark: {
     type: String,
     trim: true,
@@ -190,6 +197,40 @@ const counterOrderSchema = new mongoose.Schema({
     trim: true,
     default: null,
   },
+
+  // ─── Non-chargeable ──────────────────────────────────────────────────────
+  // Internal consumption: staff meals, management/owner, tasting, wastage.
+  // Kept separate from complimentary so month-end reporting can show
+  // "spent on customers" and "consumed internally" as different figures.
+  isNonChargeable: {
+    type: Boolean,
+    default: false,
+  },
+  nonChargeableReason: {
+    type: String,
+    trim: true,
+    default: null,
+  },
+  nonChargeableType: {
+    type: String,
+    enum: ["staff", "management", "tasting", "wastage", "other", null],
+    default: null,
+  },
+  nonChargeableBy: {
+    type: String,
+    trim: true,
+    default: null,
+  },
+  nonChargeableAt: {
+    type: Date,
+    default: null,
+  },
+  // Amount before it was zeroed out, so reports can show what it cost
+  originalGrandTotal: {
+    type: Number,
+    default: null,
+  },
+
   paymentMethod: {
     type: String,
     required: [true, "Payment method is required"],
@@ -204,8 +245,30 @@ const counterOrderSchema = new mongoose.Schema({
   paymentStatus: {
     type: String,
     required: [true, "Payment status is required"],
-    enum: ["pending", "completed", "failed", "refunded", "consolidated"],
+    enum: ["pending", "completed", "failed", "refunded", "consolidated", "billed"],
     default: "pending",
+  },
+  // Settlement details — filled when a 'billed' order is settled (payment collected)
+  settlementDetails: {
+    method: {
+      type: String,
+      enum: ["cash", "upi", "card", null],
+      default: null,
+    },
+    utr: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    settledAt: {
+      type: Date,
+      default: null,
+    },
+    settledBy: {
+      type: String,
+      trim: true,
+      default: null,
+    },
   },
   cancellationReason: {
     type: String,
@@ -227,7 +290,35 @@ const counterOrderSchema = new mongoose.Schema({
     type: Date,
     default: Date.now,
   },
+  // Business day (YYYY-MM-DD) this order belongs to, honouring the late-night
+  // cutoff. Stored rather than derived so it can back a unique index — invoice
+  // numbers restart at 001 daily, so uniqueness is only meaningful per day.
+  businessDay: {
+    type: String,
+    default: null,
+  },
 })
+
+// ─── Uniqueness ────────────────────────────────────────────────────────────
+// A bill is unique per branch + business day + invoice number. Without this,
+// the offline sync queue's retries created duplicate bills (invoice 015 once
+// reached 8 copies), silently inflating revenue. The application-level check in
+// createCounterOrder catches sequential retries; this index is what stops two
+// concurrent requests from both slipping through.
+//
+// Partial filter: applies only to real bills — KOTs have no invoiceNumber, and
+// several KOTs per day is normal.
+counterOrderSchema.index(
+  { branch: 1, businessDay: 1, invoiceNumber: 1 },
+  {
+    unique: true,
+    name: "uniq_bill_per_branch_day",
+    partialFilterExpression: {
+      invoiceNumber: { $type: "string" },
+      businessDay: { $type: "string" },
+    },
+  }
+)
 
 // Add indexes for better query performance
 counterOrderSchema.index({ userId: 1, createdAt: -1 })
@@ -241,6 +332,7 @@ counterOrderSchema.index({ phoneNumber: 1 })
 counterOrderSchema.index({ invoiceNumber: 1 })
 counterOrderSchema.index({ kotNumber: 1 })
 counterOrderSchema.index({ isComplimentary: 1 })
+counterOrderSchema.index({ isNonChargeable: 1 })
 // Compound indexes for common query patterns (faster filtering)
 counterOrderSchema.index({ branch: 1, categoryName: 1, createdAt: -1 })
 counterOrderSchema.index({ branch: 1, createdAt: -1 })

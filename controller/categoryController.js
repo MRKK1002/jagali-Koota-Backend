@@ -1,4 +1,5 @@
 const Category = require('../model/Category');
+const Menu = require('../model/menuModel');
 const fs = require('fs').promises;
 const path = require('path');
 const { uploadFile2, deleteFile } = require('../middleware/AWS');
@@ -173,6 +174,19 @@ exports.updateCategory = async (req, res) => {
 
     if (!category) {
       return res.status(404).json({ message: 'Category not found' });
+    }
+
+    // If GST rate was changed, bulk-update all menu items in this category
+    if (gstRate !== undefined) {
+      const newGst = Number(gstRate) || 0
+      Menu.updateMany(
+        { categoryId: category._id },
+        { $set: { gstRate: newGst } }
+      ).then(result => {
+        console.log(`[Category GST] Updated ${result.modifiedCount} menu items to ${newGst}% for category "${category.name}"`)
+      }).catch(err => {
+        console.warn('[Category GST] Bulk update failed:', err.message)
+      })
     }
 
     res.status(200).json({ message: 'Category updated successfully', category });

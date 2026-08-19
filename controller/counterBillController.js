@@ -394,9 +394,12 @@ exports.listCounterBills = asyncHandler(async (req, res) => {
     query.date = { $gte: startDate, $lte: endDate }
   }
 
-  // Exclude complimentary bills from sales reports unless explicitly requested
+  // Exclude give-aways from sales reports unless explicitly requested
   if (!includeComplimentary || includeComplimentary === 'false') {
     query.isComplimentary = { $ne: true }
+  }
+  if (!req.query.includeNonChargeable || req.query.includeNonChargeable === 'false') {
+    query.isNonChargeable = { $ne: true }
   }
 
   const counterBills = await CounterBill.find(query)

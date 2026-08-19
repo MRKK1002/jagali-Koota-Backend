@@ -27,6 +27,13 @@ const menuSchema = new mongoose.Schema({
     min: [0, 'GST rate cannot be negative'],
     max: [100, 'GST rate cannot exceed 100%']
   },
+  // Food type for veg/non-veg/egg filtering. Not schema-required so the 20
+  // legacy items without it stay editable; enforced in the create controller.
+  foodType: {
+    type: String,
+    enum: ['veg', 'non-veg', 'egg'],
+    default: null
+  },
   // Old structure kept for backward compatibility
   quantities: {
     type: [String],
@@ -211,7 +218,14 @@ const menuSchema = new mongoose.Schema({
       min: [0, 'Discount cannot be negative'],
       max: [100, 'Discount cannot exceed 100%']
     }
-  }
+  },
+
+  // Temporary disable — item hidden from billing + public menu until this time.
+  // Null = active. Set to business-day-end to disable "for today".
+  disabledUntil: {
+    type: Date,
+    default: null,
+  },
 
 }, {
   timestamps: true

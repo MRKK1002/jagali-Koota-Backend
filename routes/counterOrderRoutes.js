@@ -33,6 +33,15 @@ router.put("/orders/:id/payment-status", counterOrderController.updateCounterPay
 // Cancel order with reason
 router.put("/orders/:id/cancel", counterOrderController.cancelCounterOrder)
 
+// Settle a billed order (collect payment method + UTR)
+router.put("/orders/:id/settle", counterOrderController.settleOrder)
+
+// Non-chargeable (internal consumption) — separate from complimentary
+router.get("/sales-report", counterOrderController.getSalesReport)
+router.get("/non-chargeable-orders", counterOrderController.getNonChargeableOrders)
+router.get("/non-chargeable-summary", counterOrderController.getNonChargeableSummary)
+router.put("/orders/:id/non-chargeable", counterOrderController.markNonChargeable)
+
 // Clear all orders (for testing/cleanup)
 router.delete("/orders/clear-all", counterOrderController.clearAllCounterOrders)
 

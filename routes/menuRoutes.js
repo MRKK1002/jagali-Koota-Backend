@@ -21,6 +21,8 @@ router.get('/', menuController.getAllMenuItems);
 router.get('/:id', menuController.getMenuItemById);
 router.put('/:id', upload.single('image'), menuController.updateMenuItem);
 router.delete('/:id', menuController.deleteMenuItem);
+router.put('/:id/disable-today', menuController.disableToday);
+router.put('/:id/enable', menuController.enableItem);
 router.get('/category/:categoryId', menuController.getMenuItemsByCategory);
 
 

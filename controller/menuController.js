@@ -44,6 +44,7 @@ exports.createMenuItem = async (req, res) => {
       menuTypes,
       categoryId,
       subcategoryId,
+      foodType,
       branchId,
       subscriptionEnabled,
       subscriptionPlans,
@@ -63,7 +64,14 @@ exports.createMenuItem = async (req, res) => {
       _id
     } = req.body;
 
+    // Subcategory is optional — not all categories need subcategories.
+    // If provided, it will be stored; otherwise null.
 
+    // Food type is required for new items (veg / non-veg / egg).
+    const allowedFoodTypes = ['veg', 'non-veg', 'egg'];
+    if (!foodType || !allowedFoodTypes.includes(foodType)) {
+      return res.status(400).json({ message: 'Food type is required and must be one of: veg, non-veg, egg' });
+    }
 
 
     // Parse JSON strings if needed
@@ -155,6 +163,7 @@ exports.createMenuItem = async (req, res) => {
       menuTypes: parsedMenuTypes || parsedQuantities,
       categoryId,
       subcategoryId: subcategoryId || null,
+      foodType,
       branchId,
       image,
       subscriptionEnabled: subscriptionEnabled === 'true' || subscriptionEnabled === true,
@@ -223,6 +232,19 @@ exports.getAllMenuItems = async (req, res) => {
     if (subcategoryId) filter.subcategoryId = subcategoryId;
     if (branchId) filter.branchId = branchId;
     if (isActive !== undefined) filter.isActive = isActive === 'true';
+
+    // Exclude items disabled for today (disabledUntil > now)
+    // Unless explicitly requested with includeDisabled=true (for admin Products page)
+    if (req.query.includeDisabled !== 'true') {
+      filter.$and = filter.$and || [];
+      filter.$and.push({
+        $or: [
+          { disabledUntil: null },
+          { disabledUntil: { $exists: false } },
+          { disabledUntil: { $lte: new Date() } },
+        ]
+      });
+    }
 
     // Search filter - search by name, itemName, description, or number in name
     // Support both full phrase match and individual word matches
@@ -300,7 +322,7 @@ exports.getAllMenuItems = async (req, res) => {
         .populate('categoryId', 'name')
         .populate('subcategoryId', 'name')
         .populate('branchId', 'name')
-        .select('name itemName description price gstRate quantities prices menuTypes image categoryId subcategoryId branchId stock lowStockAlert isActive subscriptionEnabled subscriptionPlans subscriptionAmount subscriptionDiscount subscriptionDuration subscription3Days subscription1Week subscription1Month subscription30Days subscription3DaysDiscount subscription1WeekDiscount subscription1MonthDiscount subscription3DaysPrice subscription1WeekPrice subscription1MonthPrice createdAt updatedAt')
+        .select('name itemName description price gstRate foodType quantities prices menuTypes image categoryId subcategoryId branchId stock lowStockAlert isActive subscriptionEnabled subscriptionPlans subscriptionAmount subscriptionDiscount subscriptionDuration subscription3Days subscription1Week subscription1Month subscription30Days subscription3DaysDiscount subscription1WeekDiscount subscription1MonthDiscount subscription3DaysPrice subscription1WeekPrice subscription1MonthPrice createdAt updatedAt')
         .sort(sort)
         .skip(skip)
         .limit(limitNum)
@@ -367,7 +389,6 @@ exports.getAllMenuItems = async (req, res) => {
       }
     };
 
-    // Cache the response
     setMenuCached(cacheKey, responseBody)
 
     res.status(200).json(responseBody);
@@ -386,7 +407,7 @@ exports.getMenuItemById = async (req, res) => {
       .populate('categoryId', 'name')
       .populate('subcategoryId', 'name')
       .populate('branchId', 'name')
-      .select('name description price gstRate image categoryId subcategoryId branchId stock lowStockAlert isActive subscriptionEnabled subscriptionPlans subscriptionAmount subscriptionDiscount subscriptionDuration subscription3Days subscription1Week subscription1Month subscription30Days subscription3DaysDiscount subscription1WeekDiscount subscription1MonthDiscount subscription3DaysPrice subscription1WeekPrice subscription1MonthPrice');
+      .select('name description price gstRate foodType image categoryId subcategoryId branchId stock lowStockAlert isActive subscriptionEnabled subscriptionPlans subscriptionAmount subscriptionDiscount subscriptionDuration subscription3Days subscription1Week subscription1Month subscription30Days subscription3DaysDiscount subscription1WeekDiscount subscription1MonthDiscount subscription3DaysPrice subscription1WeekPrice subscription1MonthPrice');
       
     if (!menuItem) {
       return res.status(404).json({ message: 'Menu item not found' });
@@ -409,6 +430,7 @@ exports.updateMenuItem = async (req, res) => {
       menuTypes,
       categoryId,
       subcategoryId,
+      foodType,
       branchId,
       subscriptionEnabled,
       subscriptionPlans,
@@ -494,6 +516,12 @@ exports.updateMenuItem = async (req, res) => {
       subscription1WeekPrice: parseFloat(subscription1WeekPrice) || 0,
       subscription1MonthPrice: parseFloat(subscription1MonthPrice) || 0
     };
+
+    // Only update foodType when a valid value is sent, so editing a legacy
+    // item without choosing one never wipes an existing value.
+    if (['veg', 'non-veg', 'egg'].includes(foodType)) {
+      updateData.foodType = foodType;
+    }
 
     // Remove undefined fields
     Object.keys(updateData).forEach(key => 
@@ -596,3 +624,66 @@ exports.getMenuItemsByCategory = async (req, res) => {
     res.status(500).json({ message: 'Error fetching menu items', error: error.message });
   }
 }; 
+
+
+// ─── PUT /menu/:id/disable-today ─────────────────────────────────────────────
+// Disable a menu item for the rest of the current business day.
+// The item will automatically become available again after business day cutoff.
+exports.disableToday = async (req, res) => {
+  try {
+    const menuItem = await Menu.findById(req.params.id);
+    if (!menuItem) {
+      return res.status(404).json({ message: 'Menu item not found' });
+    }
+
+    // Business day ends at CUTOFF hour (default 3 AM) next day
+    const { businessDayRange } = require('../utils/businessDay');
+    const now = new Date();
+    // Get today's business day range — disabledUntil = end of business day
+    const todayKey = require('../utils/businessDay').businessDayKey(now);
+    const { end } = businessDayRange(todayKey);
+
+    menuItem.disabledUntil = end;
+    await menuItem.save();
+    invalidateMenuCache();
+
+    res.status(200).json({
+      success: true,
+      message: `"${menuItem.name || menuItem.itemName}" disabled until ${end.toLocaleString('en-IN')}`,
+      menuItem: {
+        id: menuItem._id,
+        name: menuItem.name || menuItem.itemName,
+        disabledUntil: menuItem.disabledUntil,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error disabling menu item', error: error.message });
+  }
+};
+
+// ─── PUT /menu/:id/enable ────────────────────────────────────────────────────
+// Re-enable a disabled menu item immediately.
+exports.enableItem = async (req, res) => {
+  try {
+    const menuItem = await Menu.findById(req.params.id);
+    if (!menuItem) {
+      return res.status(404).json({ message: 'Menu item not found' });
+    }
+
+    menuItem.disabledUntil = null;
+    await menuItem.save();
+    invalidateMenuCache();
+
+    res.status(200).json({
+      success: true,
+      message: `"${menuItem.name || menuItem.itemName}" is now enabled`,
+      menuItem: {
+        id: menuItem._id,
+        name: menuItem.name || menuItem.itemName,
+        disabledUntil: null,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error enabling menu item', error: error.message });
+  }
+};

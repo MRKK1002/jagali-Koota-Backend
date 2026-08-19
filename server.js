@@ -1,3 +1,10 @@
+// ─── Timezone: MUST be set before anything creates a Date ───────────────────
+// Every business-day calculation (the 3 AM cutoff, sales-report date windows,
+// invoice/KOT day counters) uses server LOCAL time. Cloud VMs default to UTC,
+// which would shift the cutoff by 5:30 and silently file late-night bills under
+// the wrong trading day. Pin it explicitly.
+process.env.TZ = process.env.TZ || "Asia/Kolkata";
+
 const express = require("express");
 const mongoose = require("mongoose");
 const dotenv = require("dotenv");
@@ -128,6 +135,7 @@ const tableRoutes = require("./routes/tableRoutes");
 const staffOrderRoutes = require("./routes/staffOrderRoutes");
 // const mobileStaffOrderRoutes = require("./routes/mobileStaffOrderRoutes");
 const counterOrderRoutes = require("./routes/counterOrderRoutes");
+const billingSessionRoutes = require("./routes/billingSessionRoutes");
 const counterBillRoutes = require("./routes/counterBillRoutes");
 const serverRoutes = require("./routes/serverRoutes");
 // const staffInvoiceRoutes = require("./routes/staffInvoiceRoutes");
@@ -201,6 +209,7 @@ app.use("/api/v1/hotel/table", tableRoutes);
 app.use("/api/v1/hotel/staff-order", staffOrderRoutes);
 // app.use("/api/v1/hotel/mobile-staff-order", mobileStaffOrderRoutes);
 app.use("/api/v1/hotel/counter-order", counterOrderRoutes);
+app.use("/api/v1/hotel/billing-session", billingSessionRoutes);
 app.use("/api/v1/hotel/servers", serverRoutes);
 app.use("/api/v1/hotel/counter-bill", counterBillRoutes);
 // app.use("/api/v1/hotel/staff-invoice", staffInvoiceRoutes);
@@ -226,6 +235,7 @@ app.use("/api/v1/hotel/purchase-user-auth", purchaseUserRoutes);
 // app.use("/api/v1/hotel/mobile-room-booking", mobileRoomBookingRoutes);
 // app.use("/api/v1/hotel/housekeeping", housekeepingRoutes);
 app.use("/api/v1/hotel/category-access", categoryAccessRoutes);
+app.use("/api/v1/hotel/admin-access", require("./routes/adminAccessRoutes"));
 // app.use("/api/v1/hotel/receptionist-access", receptionistAccessRoutes);
 
 // Public Restaurant Order Routes

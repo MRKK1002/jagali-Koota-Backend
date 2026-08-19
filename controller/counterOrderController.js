@@ -6,6 +6,9 @@ const Counter = require("../model/counterLoginModel")
 const asyncHandler = require("express-async-handler")
 const Recipe = require("../model/recipe")
 const RawMaterial = require("../model/rawMaterialModel")
+const BillingSession = require("../model/billingSessionModel")
+const NonChargeableTracking = require("../model/nonChargeableTrackingModel")
+const { businessDayKey, businessDayRange } = require("../utils/businessDay")
 
 // ─── In-Memory Cache for GET orders (60s TTL) ──────────────────────────────
 // Only caches READ responses. Invalidated on any write (create/update/cancel).
@@ -100,6 +103,9 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
     orderStatus: reqOrderStatus,
     isComplimentary = false,
     complimentaryReason = null,
+    isNonChargeable = false,
+    nonChargeableReason = null,
+    nonChargeableType = null,
     // Optional: allow frontend to send these, but we'll calculate them
     subtotal: providedSubtotal,
     tax: providedTax,
@@ -172,6 +178,81 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
     throw new Error("Branch not found")
   }
 
+  // ── Idempotency guard ───────────────────────────────────────────────────
+  // The offline sync queue retries bill uploads, and its own comment says it
+  // "relies solely on the server's 409 duplicate response" to detect repeats.
+  // Nothing here ever returned 409, so every retry created another document —
+  // invoice 015 ended up with 8 copies, inflating revenue.
+  //
+  // A bill is uniquely identified by branch + invoiceNumber + business day
+  // (invoice numbers legitimately restart at 001 each day, so the day matters).
+  // Returning 409 makes the endpoint safe to retry: the queue marks the entry
+  // synced instead of duplicating it.
+  if (req.body.invoiceNumber) {
+    try {
+      const { start, end } = businessDayRange(businessDayKey())
+      if (start && end) {
+        const existing = await CounterOrder.findOne({
+          branch: branchId,
+          invoiceNumber: req.body.invoiceNumber,
+          kotNumber: { $in: [null, undefined, ""] }, // bills only, not KOTs
+          createdAt: { $gte: start, $lte: end },
+        })
+          .select("_id invoiceNumber grandTotal createdAt")
+          .lean()
+
+        if (existing) {
+          console.log(
+            `[createCounterOrder] Duplicate bill ${req.body.invoiceNumber} for this branch/day — returning existing ${existing._id}`
+          )
+          return res.status(409).json({
+            success: false,
+            duplicate: true,
+            message: `Bill ${req.body.invoiceNumber} already exists for this branch today`,
+            order: {
+              id: existing._id,
+              _id: existing._id,
+              invoiceNumber: existing.invoiceNumber,
+              grandTotal: existing.grandTotal,
+              createdAt: existing.createdAt,
+            },
+          })
+        }
+      }
+    } catch (dupErr) {
+      // A lookup failure must not block billing — log and continue
+      console.warn(`[createCounterOrder] Duplicate check skipped: ${dupErr.message}`)
+    }
+  }
+
+  // ── Billing-session lock ────────────────────────────────────────────────
+  // Once a business day is closed (Z-Report frozen), no new bill may be added
+  // to it. KOTs are still allowed so the kitchen isn't blocked mid-service —
+  // only actual bills (those carrying an invoiceNumber) are refused.
+  if (req.body.invoiceNumber) {
+    try {
+      // Business day, not calendar day — a 1 AM bill belongs to last night
+      const todayKey = businessDayKey()
+      const session = await BillingSession.findOne({ branchId, date: todayKey })
+        .select("status")
+        .lean()
+      if (session && session.status === "closed") {
+        // 423 Locked — deliberately NOT 409, because the offline sync queue
+        // treats 409 as "duplicate bill, already saved" and silently marks the
+        // entry synced. That would hide this rejection from the cashier.
+        res.status(423)
+        throw new Error(
+          `BILLING_CLOSED: Billing for ${todayKey} is closed. Reopen billing before creating new bills.`
+        )
+      }
+    } catch (err) {
+      // Re-throw our own lock error; swallow infrastructure errors so a DB
+      // hiccup never blocks billing.
+      if (res.statusCode === 423) throw err
+      console.warn(`[createCounterOrder] Billing session check skipped: ${err.message}`)
+    }
+  }
+
   // Verify invoice exists (optional - allow orders even if invoice not found)
   let invoice = null
   if (invoiceId) {
@@ -241,28 +322,60 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
     grandTotal: finalGrandTotal,
     isComplimentary,
     complimentaryReason,
+    // Non-chargeable at bill time (staff meal, tasting, wastage). A bill can be
+    // complimentary OR non-chargeable, never both — complimentary wins if both
+    // somehow arrive.
+    isNonChargeable: isComplimentary ? false : (isNonChargeable === true || isNonChargeable === 'true'),
+    nonChargeableReason: isComplimentary ? null : (nonChargeableReason || null),
+    nonChargeableType: isComplimentary
+      ? null
+      : (["staff", "management", "tasting", "wastage", "other"].includes(nonChargeableType) ? nonChargeableType : null),
     paymentMethod: ["cash", "card", "upi", "qr"].includes(paymentMethod) ? paymentMethod : 'cash',
-    // If paymentStatus is 'completed', orderStatus must also be 'completed' regardless of what was sent
-    orderStatus: (reqPaymentStatus === 'completed' || status === 'completed')
+    // If paymentStatus is 'completed', orderStatus must also be 'completed' regardless of what was sent.
+    // 'billed' means the bill is finalised but payment is not yet settled — orderStatus is still
+    // 'completed' (kitchen work done) while paymentStatus stays 'billed' until settlement.
+    orderStatus: (reqPaymentStatus === 'completed' || reqPaymentStatus === 'billed' || status === 'completed')
       ? 'completed'
       : (reqOrderStatus && ["pending", "processing", "completed", "cancelled"].includes(reqOrderStatus)
           ? reqOrderStatus
           : "processing"),
-    paymentStatus: reqPaymentStatus && ["pending", "completed", "failed", "refunded", "consolidated"].includes(reqPaymentStatus)
-      ? reqPaymentStatus
-      : (status || "completed"),
-  })
-
-  // Save to database
-  // console.log('💾 Saving counter order with category info:', {
-  //   categoryName: counterOrder.categoryName,
-  //   branchName: counterOrder.branchName,
-  //   categoryId: counterOrder.categoryId
-  // });
-  
+    // A give-away has nothing to collect, so it is already settled. Leaving it
+    // as 'billed' would make it show a Settle button and block the day close.
+    paymentStatus: (isComplimentary || isNonChargeable === true || isNonChargeable === 'true')
+      ? 'completed'
+      : (reqPaymentStatus && ["pending", "completed", "failed", "refunded", "consolidated", "billed"].includes(reqPaymentStatus)
+          ? reqPaymentStatus
+          : (status || "completed")),
+    // Backs the unique index that prevents duplicate bills
+    businessDay: businessDayKey(),
+  }) 
   try {
     await counterOrder.save()
   } catch (saveErr) {
+    // Unique index rejected a duplicate bill — this is the concurrent case the
+    // application-level check above can't catch. Report it the same way (409)
+    // so the sync queue treats it as already-uploaded rather than retrying.
+    if (saveErr.code === 11000) {
+      const existing = await CounterOrder.findOne({
+        branch: branchId,
+        businessDay: businessDayKey(),
+        invoiceNumber: counterOrder.invoiceNumber,
+      })
+        .select("_id invoiceNumber grandTotal createdAt")
+        .lean()
+        .catch(() => null)
+
+      console.log(`[createCounterOrder] Unique index blocked duplicate ${counterOrder.invoiceNumber}`)
+      return res.status(409).json({
+        success: false,
+        duplicate: true,
+        message: `Bill ${counterOrder.invoiceNumber} already exists for this branch today`,
+        order: existing
+          ? { id: existing._id, _id: existing._id, invoiceNumber: existing.invoiceNumber, grandTotal: existing.grandTotal, createdAt: existing.createdAt }
+          : null,
+      })
+    }
+
     // If MongoDB is disconnected, return 503 so the frontend knows to retry later
     const errorMessage = saveErr.message || '';
     if (saveErr.name === 'MongoNetworkError' || errorMessage.includes('ENOTFOUND') || errorMessage.includes('buffering timed out') || errorMessage.includes('topology was destroyed')) {
@@ -273,6 +386,69 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
   }
   
   console.log('[createCounterOrder] Saved successfully:', counterOrder.invoiceNumber || counterOrder._id)
+
+  // Roll a bill-time non-chargeable into the daily tracking record, the same
+  // way markNonChargeable() does for after-the-fact marking. Best-effort.
+  if (counterOrder.isNonChargeable && counterOrder.invoiceNumber) {
+    try {
+      const amt = Number(calculatedSubtotal || finalGrandTotal || 0)
+      const bucket = ["staff", "management", "tasting", "wastage"].includes(counterOrder.nonChargeableType)
+        ? counterOrder.nonChargeableType
+        : "other"
+      await NonChargeableTracking.updateOne(
+        { branchId, date: businessDayKey(counterOrder.createdAt || new Date()) },
+        {
+          $inc: {
+            totalNonChargeableBills: 1,
+            totalNonChargeableAmount: amt,
+            [`byType.${bucket}`]: amt,
+          },
+          $push: {
+            nonChargeableBills: {
+              orderId: counterOrder._id,
+              invoiceNumber: counterOrder.invoiceNumber,
+              customerName: counterOrder.customerName,
+              tableNumber: counterOrder.tableNumber,
+              amount: amt,
+              type: bucket,
+              reason: counterOrder.nonChargeableReason,
+              approvedBy: counterOrder.customerName || null,
+              time: new Date().toLocaleTimeString("en-IN", { hour12: true, hour: "2-digit", minute: "2-digit" }),
+            },
+          },
+          $setOnInsert: { branchId, date: businessDayKey(counterOrder.createdAt || new Date()) },
+        },
+        { upsert: true }
+      )
+    } catch (ncErr) {
+      console.warn('[createCounterOrder] NC tracking rollup failed:', ncErr.message)
+    }
+  }
+
+  // Auto-open the billing session on the first bill of the day, so the cashier
+  // never has to remember to "open" billing. Non-blocking and idempotent.
+  if (counterOrder.invoiceNumber) {
+    try {
+      // Business day, not calendar day — keeps late-night bills on one session
+      const todayKey = businessDayKey()
+      await BillingSession.updateOne(
+        { branchId, date: todayKey },
+        {
+          $setOnInsert: {
+            branchId,
+            branchName: branchName || branch?.name || null,
+            date: todayKey,
+            status: "open",
+            openedAt: new Date(),
+            openedBy: customerName || null,
+          },
+        },
+        { upsert: true }
+      )
+    } catch (sessionErr) {
+      console.warn('[createCounterOrder] Could not auto-open billing session:', sessionErr.message)
+    }
+  }
 
   // Invalidate order cache so next GET returns fresh data
   invalidateOrderCache()
@@ -443,52 +619,42 @@ exports.getAllCounterOrders = asyncHandler(async (req, res) => {
   // console.log('📅 Date filter params:', { startDate, endDate, date });
   // console.log('🔍 Filter params:', { search, branchId, categoryName, paymentStatus, orderStatus, paymentMethod });
   
-  // Build query to exclude complimentary orders from sales reports unless explicitly requested
+  // Build query to exclude give-aways from sales reports unless explicitly
+  // requested. Complimentary and non-chargeable are separate flags so they can
+  // be reported independently.
   const query = {}
   if (!includeComplimentary || includeComplimentary === 'false') {
     query.isComplimentary = { $ne: true }
   }
+  if (!req.query.includeNonChargeable || req.query.includeNonChargeable === 'false') {
+    query.isNonChargeable = { $ne: true }
+  }
 
-  // Add date filtering
+  // Add date filtering — uses BUSINESS day windows (cutoff-to-cutoff), not
+  // midnight-to-midnight, so late-night bills stay on the trading day they
+  // belong to. Keeps this filter consistent with the billing-session Z-Report.
   if (date) {
-    // Single date filter - filter for orders on specific date
-    const filterDate = new Date(date);
-    const startOfDay = new Date(filterDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(filterDate);
-    endOfDay.setHours(23, 59, 59, 999);
-    
-    query.createdAt = {
-      $gte: startOfDay,
-      $lte: endOfDay
-    };
-    
-    // console.log('📅 Single date filter applied:', {
-    //   date: date,
-    //   startOfDay: startOfDay,
-    //   endOfDay: endOfDay
-    // });
+    const { start, end } = businessDayRange(date);
+    if (start && end) query.createdAt = { $gte: start, $lte: end };
   } else if (startDate || endDate) {
-    // Date range filter
-    query.createdAt = {};
-    
+    // Date range filter. A bare "YYYY-MM-DD" is expanded to a business-day
+    // window; a full ISO timestamp is used verbatim because the caller already
+    // computed the exact instant it wants.
+    const range = {};
+
     if (startDate) {
-      const start = new Date(startDate);
-      start.setHours(0, 0, 0, 0);
-      query.createdAt.$gte = start;
+      const s = businessDayRange(startDate);
+      if (s.start) range.$gte = s.start;
     }
-    
+
     if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      query.createdAt.$lte = end;
+      const e = businessDayRange(endDate);
+      // For an exact timestamp the boundary IS that instant, not the window end
+      const bound = e.exact ? e.start : e.end;
+      if (bound) range.$lte = bound;
     }
-    
-    // console.log('📅 Date range filter applied:', {
-    //   startDate: startDate,
-    //   endDate: endDate,
-    //   query: query.createdAt
-    // });
+
+    if (Object.keys(range).length > 0) query.createdAt = range;
   }
 
   // Add search filter - search by customer name, phone number, invoice number, KOT number
@@ -632,6 +798,11 @@ exports.getAllCounterOrders = asyncHandler(async (req, res) => {
         paymentStatus: order.paymentStatus,
         isComplimentary: order.isComplimentary || false,
         complimentaryReason: order.complimentaryReason,
+        isNonChargeable: order.isNonChargeable || false,
+        nonChargeableReason: order.nonChargeableReason,
+        nonChargeableType: order.nonChargeableType,
+        nonChargeableBy: order.nonChargeableBy,
+        originalGrandTotal: order.originalGrandTotal,
         cancellationReason: order.cancellationReason,
         cancelledBy: order.cancelledBy,
         cancelledAt: order.cancelledAt,
@@ -925,9 +1096,9 @@ exports.updateCounterPaymentStatus = asyncHandler(async (req, res) => {
     throw new Error("Invalid order ID format")
   }
 
-  if (!paymentStatus || !["pending", "completed", "failed", "refunded", "consolidated"].includes(paymentStatus)) {
+  if (!paymentStatus || !["pending", "completed", "failed", "refunded", "consolidated", "billed"].includes(paymentStatus)) {
     res.status(400)
-    throw new Error("Invalid payment status. Must be one of: pending, completed, failed, refunded, consolidated")
+    throw new Error("Invalid payment status. Must be one of: pending, completed, failed, refunded, consolidated, billed")
   }
 
   const counterOrder = await CounterOrder.findById(id)
@@ -1124,10 +1295,13 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
   //   date, startDate, endDate, categoryName, orderStatus, page, limit 
   // });
   
-  // Build query to exclude complimentary orders unless explicitly requested
+  // Build query to exclude give-aways unless explicitly requested
   const query = {}
   if (!includeComplimentary || includeComplimentary === 'false') {
     query.isComplimentary = { $ne: true }
+  }
+  if (!req.query.includeNonChargeable || req.query.includeNonChargeable === 'false') {
+    query.isNonChargeable = { $ne: true }
   }
 
   // Only include orders with invoice numbers (completed bills)
@@ -1136,32 +1310,26 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
     { 'invoice': { $exists: true, $ne: null } }
   ]
 
-  // Add date filtering
+  // Add date filtering — business day windows (cutoff-to-cutoff), matching the
+  // counter sales report and the billing-session Z-Report.
   if (date) {
-    const filterDate = new Date(date);
-    const startOfDay = new Date(filterDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(filterDate);
-    endOfDay.setHours(23, 59, 59, 999);
-    
-    query.createdAt = {
-      $gte: startOfDay,
-      $lte: endOfDay
-    };
+    const { start, end } = businessDayRange(date);
+    if (start && end) query.createdAt = { $gte: start, $lte: end };
   } else if (startDate || endDate) {
-    query.createdAt = {};
-    
+    const range = {};
+
     if (startDate) {
-      const start = new Date(startDate);
-      start.setHours(0, 0, 0, 0);
-      query.createdAt.$gte = start;
+      const s = businessDayRange(startDate);
+      if (s.start) range.$gte = s.start;
     }
-    
+
     if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      query.createdAt.$lte = end;
+      const e = businessDayRange(endDate);
+      const bound = e.exact ? e.start : e.end;
+      if (bound) range.$lte = bound;
     }
+
+    if (Object.keys(range).length > 0) query.createdAt = range;
   }
 
   // Add search filter
@@ -1264,6 +1432,12 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
     CounterOrder.countDocuments(query)
   ]);
 
+  // Same filters, minus the give-away exclusions. Needed so the complimentary
+  // and non-chargeable badge counts aren't zeroed out by their own filter.
+  const baseQuery = { ...query };
+  delete baseQuery.isComplimentary;
+  delete baseQuery.isNonChargeable;
+
   // Calculate category counts (for all matching orders, not just current page)
   const categoryCounts = await Promise.all([
     // Self Service count
@@ -1296,6 +1470,19 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
     CounterOrder.countDocuments({
       ...query,
       categoryName: /temple/i
+    }),
+    // Complimentary count — for the Complimentary tab badge. Counted server-side
+    // so the badge is correct on every tab, not just while that tab is open.
+    // Uses baseQuery (not query) so the flag's own exclusion filter doesn't
+    // zero out its own count.
+    CounterOrder.countDocuments({
+      ...baseQuery,
+      isComplimentary: true
+    }),
+    // Non-chargeable count — same reasoning
+    CounterOrder.countDocuments({
+      ...baseQuery,
+      isNonChargeable: true
     })
   ]);
 
@@ -1303,7 +1490,11 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
   const allMatchingOrders = await CounterOrder.find(query).select('grandTotal totalAmount orderStatus').lean();
   
   const stats = {
-    totalOrders: totalCount,
+    // Orders that actually count as sales — cancelled ones are reported
+    // separately, so including them here would double-count on screen.
+    totalOrders: 0,
+    // Every matching document, cancelled included (for pagination/debug)
+    matchedOrders: totalCount,
     totalRevenue: 0,
     cancelledOrders: 0,
     cancelledAmount: 0,
@@ -1319,6 +1510,7 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
       stats.cancelledOrders++;
       stats.cancelledAmount += amount;
     } else {
+      stats.totalOrders++;
       stats.totalRevenue += amount;
       if (status === 'completed') {
         stats.completedOrders++;
@@ -1327,6 +1519,10 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
       }
     }
   });
+
+  // Round money to 2dp — float sums produce artefacts like 13562.199999999
+  stats.totalRevenue = Number(stats.totalRevenue.toFixed(2));
+  stats.cancelledAmount = Number(stats.cancelledAmount.toFixed(2));
 
   // Log performance
   const queryTime = Date.now() - startTime;
@@ -1344,6 +1540,8 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
         restaurant: categoryCounts[1],
         templeMeals: categoryCounts[2]
       },
+      complimentaryCount: categoryCounts[3] || 0,
+      nonChargeableCount: categoryCounts[4] || 0,
       pagination: {
         currentPage: pageNum,
         totalPages: 0,
@@ -1403,6 +1601,11 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
         paymentStatus: order.paymentStatus,
         isComplimentary: order.isComplimentary || false,
         complimentaryReason: order.complimentaryReason,
+        isNonChargeable: order.isNonChargeable || false,
+        nonChargeableReason: order.nonChargeableReason,
+        nonChargeableType: order.nonChargeableType,
+        nonChargeableBy: order.nonChargeableBy,
+        originalGrandTotal: order.originalGrandTotal,
         cancellationReason: order.cancellationReason,
         cancelledBy: order.cancelledBy,
         cancelledAt: order.cancelledAt,
@@ -1431,6 +1634,8 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
       restaurant: categoryCounts[1],
       templeMeals: categoryCounts[2]
     },
+    complimentaryCount: categoryCounts[3] || 0,
+    nonChargeableCount: categoryCounts[4] || 0,
     pagination: {
       currentPage: pageNum,
       totalPages,
@@ -1451,5 +1656,558 @@ exports.getCategorizedOrders = asyncHandler(async (req, res) => {
       orderStatus,
       paymentMethod
     }
+  })
+})
+// ─── Settle a billed order (collect payment) ─────────────────────────────────
+// PUT /api/v1/hotel/counter-order/orders/:id/settle
+exports.settleOrder = asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const { paymentMethod, utr, settledBy } = req.body
+
+  // Validate payment method
+  if (!paymentMethod || !['cash', 'upi', 'card'].includes(paymentMethod)) {
+    res.status(400)
+    throw new Error('Payment method is required and must be one of: cash, upi, card')
+  }
+
+  // UTR is optional for UPI — cashiers often settle before the reference lands
+  const order = await CounterOrder.findById(id)
+  if (!order) {
+    res.status(404)
+    throw new Error('Order not found')
+  }
+
+  // Nothing to collect on a give-away
+  if (order.isNonChargeable) {
+    res.status(400)
+    throw new Error('Order is non-chargeable — there is no payment to settle')
+  }
+  if (order.isComplimentary) {
+    res.status(400)
+    throw new Error('Order is complimentary — there is no payment to settle')
+  }
+
+  // Only 'billed' orders can be settled
+  if (order.paymentStatus !== 'billed') {
+    res.status(400)
+    throw new Error(`Cannot settle order with status "${order.paymentStatus}". Only "billed" orders can be settled.`)
+  }
+
+  // Update payment status and settlement details
+  order.paymentStatus = 'completed'
+  order.paymentMethod = paymentMethod
+  order.settlementDetails = {
+    method: paymentMethod,
+    utr: utr || null,
+    settledAt: new Date(),
+    settledBy: settledBy || null,
+  }
+
+  await order.save()
+
+  // Invalidate any cached order lists
+  if (typeof invalidateOrderCache === 'function') {
+    invalidateOrderCache()
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Order settled successfully',
+    order: {
+      id: order._id,
+      invoiceNumber: order.invoiceNumber,
+      grandTotal: order.grandTotal,
+      paymentMethod: order.paymentMethod,
+      paymentStatus: order.paymentStatus,
+      settlementDetails: order.settlementDetails,
+    },
+  })
+})
+// ─── Mark an order non-chargeable (internal consumption) ─────────────────────
+// PUT /api/v1/hotel/counter-order/orders/:id/non-chargeable
+//
+// Distinct from complimentary: complimentary is a goodwill give-away to a
+// customer, non-chargeable is internal consumption (staff meal, management,
+// tasting, wastage). Both zero the bill, but they are reported separately.
+exports.markNonChargeable = asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const { reason, type, approvedBy } = req.body
+
+  const allowedTypes = ["staff", "management", "tasting", "wastage", "other"]
+
+  if (!reason || !String(reason).trim()) {
+    res.status(400)
+    throw new Error("A reason is required to mark an order non-chargeable")
+  }
+  if (!type || !allowedTypes.includes(type)) {
+    res.status(400)
+    throw new Error(`Type is required and must be one of: ${allowedTypes.join(", ")}`)
+  }
+
+  const order = await CounterOrder.findById(id)
+  if (!order) {
+    res.status(404)
+    throw new Error("Order not found")
+  }
+
+  const ordStatus = String(order.orderStatus || "").toLowerCase()
+  if (ordStatus === "cancelled") {
+    res.status(400)
+    throw new Error("Cannot mark a cancelled order non-chargeable")
+  }
+  if (order.isNonChargeable) {
+    res.status(400)
+    throw new Error("Order is already marked non-chargeable")
+  }
+  if (order.isComplimentary) {
+    res.status(400)
+    throw new Error("Order is already complimentary — it cannot also be non-chargeable")
+  }
+
+  // Preserve what the bill was worth before zeroing it
+  const original = Number(order.grandTotal != null ? order.grandTotal : order.totalAmount || 0)
+
+  order.isNonChargeable = true
+  order.nonChargeableReason = String(reason).trim()
+  order.nonChargeableType = type
+  order.nonChargeableBy = approvedBy ? String(approvedBy).trim() : null
+  order.nonChargeableAt = new Date()
+  order.originalGrandTotal = original
+
+  // No money changes hands, so the bill is settled at zero. This deliberately
+  // does NOT block the day close — same behaviour as complimentary.
+  order.grandTotal = 0
+  order.totalAmount = 0
+  order.gstAmount = 0
+  order.tax = 0
+  order.paymentStatus = "completed"
+  order.orderStatus = "completed"
+
+  await order.save()
+
+  // Roll up into the per-day tracking record (best-effort — a tracking failure
+  // must not undo a saved order)
+  try {
+    const branchId = order.branch
+    const day = businessDayKey(order.createdAt || new Date())
+    const bucket = allowedTypes.includes(type) ? type : "other"
+
+    await NonChargeableTracking.findOneAndUpdate(
+      { branchId, date: day },
+      {
+        $inc: {
+          totalNonChargeableBills: 1,
+          totalNonChargeableAmount: original,
+          [`byType.${bucket}`]: original,
+        },
+        $push: {
+          nonChargeableBills: {
+            orderId: order._id,
+            invoiceNumber: order.invoiceNumber || null,
+            customerName: order.customerName || null,
+            tableNumber: order.tableNumber || null,
+            amount: original,
+            type,
+            reason: String(reason).trim(),
+            approvedBy: approvedBy ? String(approvedBy).trim() : null,
+            time: new Date().toLocaleTimeString("en-IN", { hour12: true, hour: "2-digit", minute: "2-digit" }),
+          },
+        },
+        $setOnInsert: { branchId, date: day },
+      },
+      { upsert: true, new: true, runValidators: true }
+    )
+  } catch (trackErr) {
+    console.warn("[markNonChargeable] tracking rollup failed:", trackErr.message)
+  }
+
+  invalidateOrderCache()
+
+  res.status(200).json({
+    success: true,
+    message: "Order marked non-chargeable",
+    order: {
+      id: order._id,
+      invoiceNumber: order.invoiceNumber,
+      originalGrandTotal: order.originalGrandTotal,
+      grandTotal: order.grandTotal,
+      isNonChargeable: order.isNonChargeable,
+      nonChargeableType: order.nonChargeableType,
+      nonChargeableReason: order.nonChargeableReason,
+      nonChargeableBy: order.nonChargeableBy,
+      nonChargeableAt: order.nonChargeableAt,
+    },
+  })
+})
+
+// ─── GET /api/v1/hotel/counter-order/sales-report ────────────────────────────
+// Aggregated sales report: category-wise or item-wise.
+// Excludes cancelled, complimentary, and non-chargeable orders.
+// Supports date range (business-day aware) and branch filter.
+exports.getSalesReport = asyncHandler(async (req, res) => {
+  const {
+    branchId,
+    startDate,
+    endDate,
+    groupBy = 'category', // 'category' | 'item'
+    page = 1,
+    limit = 20,
+  } = req.query
+
+  if (!branchId) {
+    res.status(400)
+    throw new Error("branchId is required")
+  }
+  if (!startDate || !endDate) {
+    res.status(400)
+    throw new Error("startDate and endDate are required")
+  }
+
+  // Build date range using business-day-aware helpers
+  const startRange = businessDayRange(startDate)
+  const endRange = businessDayRange(endDate)
+  const dateFilter = {}
+  if (startRange.start) dateFilter.$gte = startRange.start
+  if (endRange.end) dateFilter.$lte = endRange.exact ? endRange.start : endRange.end
+
+  if (!dateFilter.$gte || !dateFilter.$lte) {
+    res.status(400)
+    throw new Error("Invalid date range")
+  }
+
+  // Base match: active orders only (no cancelled, no complimentary, no NC)
+  const matchStage = {
+    branch: new (require('mongoose').Types.ObjectId)(branchId),
+    createdAt: dateFilter,
+    orderStatus: { $ne: 'cancelled' },
+    isComplimentary: { $ne: true },
+    isNonChargeable: { $ne: true },
+    // Only include completed bills (have invoiceNumber), not raw KOTs
+    invoiceNumber: { $ne: null },
+  }
+
+  if (groupBy === 'category') {
+    // Category-wise aggregation — groups by menu item's actual category (Conti Kitchen, Tandoori, etc.)
+    const pipeline = [
+      { $match: matchStage },
+      { $unwind: '$items' },
+      // Lookup the menu item to get its categoryId
+      {
+        $lookup: {
+          from: 'menus',
+          localField: 'items.menuItemId',
+          foreignField: '_id',
+          as: '_menuItem'
+        }
+      },
+      // Lookup the category name
+      {
+        $lookup: {
+          from: 'categoryys',
+          localField: '_menuItem.categoryId',
+          foreignField: '_id',
+          as: '_category'
+        }
+      },
+      {
+        $group: {
+          _id: { $ifNull: [{ $arrayElemAt: ['$_category.name', 0] }, 'Uncategorized'] },
+          orders: { $addToSet: '$_id' },
+          itemsSold: { $sum: '$items.quantity' },
+          revenue: { $sum: { $multiply: ['$items.price', '$items.quantity'] } },
+          gst: {
+            $sum: {
+              $multiply: [
+                { $multiply: ['$items.price', '$items.quantity'] },
+                { $divide: [{ $ifNull: ['$items.gstRate', 0] }, 100] }
+              ]
+            }
+          },
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          category: { $ifNull: ['$_id', 'Uncategorized'] },
+          orders: { $size: '$orders' },
+          itemsSold: 1,
+          revenue: { $round: ['$revenue', 2] },
+          gst: { $round: ['$gst', 2] },
+          netRevenue: { $round: [{ $add: ['$revenue', '$gst'] }, 2] },
+        }
+      },
+      { $sort: { revenue: -1 } }
+    ]
+
+    const results = await CounterOrder.aggregate(pipeline)
+
+    // Compute totals
+    const totals = results.reduce((acc, r) => {
+      acc.orders += r.orders
+      acc.itemsSold += r.itemsSold
+      acc.revenue += r.revenue
+      acc.gst += r.gst
+      acc.netRevenue += r.netRevenue
+      return acc
+    }, { orders: 0, itemsSold: 0, revenue: 0, gst: 0, netRevenue: 0 })
+
+    res.status(200).json({
+      success: true,
+      groupBy: 'category',
+      startDate,
+      endDate,
+      data: results,
+      totals: {
+        orders: totals.orders,
+        itemsSold: totals.itemsSold,
+        revenue: Math.round(totals.revenue * 100) / 100,
+        gst: Math.round(totals.gst * 100) / 100,
+        netRevenue: Math.round(totals.netRevenue * 100) / 100,
+      }
+    })
+
+  } else if (groupBy === 'item') {
+    // Item-wise aggregation — shows actual menu category for each item
+    // With server-side pagination
+    const pageNum = parseInt(page)
+    const limitNum = parseInt(limit)
+    const skip = (pageNum - 1) * limitNum
+
+    const pipeline = [
+      { $match: matchStage },
+      { $unwind: '$items' },
+      // Lookup the menu item to get its categoryId
+      {
+        $lookup: {
+          from: 'menus',
+          localField: 'items.menuItemId',
+          foreignField: '_id',
+          as: '_menuItem'
+        }
+      },
+      // Lookup the category name
+      {
+        $lookup: {
+          from: 'categoryys',
+          localField: '_menuItem.categoryId',
+          foreignField: '_id',
+          as: '_category'
+        }
+      },
+      {
+        $group: {
+          _id: { name: '$items.name', category: { $ifNull: [{ $arrayElemAt: ['$_category.name', 0] }, 'Uncategorized'] } },
+          qtySold: { $sum: '$items.quantity' },
+          unitPrice: { $avg: '$items.price' },
+          totalRevenue: { $sum: { $multiply: ['$items.price', '$items.quantity'] } },
+          gst: {
+            $sum: {
+              $multiply: [
+                { $multiply: ['$items.price', '$items.quantity'] },
+                { $divide: [{ $ifNull: ['$items.gstRate', 0] }, 100] }
+              ]
+            }
+          },
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          itemName: '$_id.name',
+          category: { $ifNull: ['$_id.category', 'Uncategorized'] },
+          qtySold: 1,
+          unitPrice: { $round: ['$unitPrice', 2] },
+          totalRevenue: { $round: ['$totalRevenue', 2] },
+          gst: { $round: ['$gst', 2] },
+        }
+      },
+      { $sort: { totalRevenue: -1 } }
+    ]
+
+    // Run full pipeline for totals count
+    const allResults = await CounterOrder.aggregate(pipeline)
+    const totalItems = allResults.length
+
+    // Compute totals from full result set
+    const totals = allResults.reduce((acc, r) => {
+      acc.qtySold += r.qtySold
+      acc.totalRevenue += r.totalRevenue
+      acc.gst += r.gst
+      return acc
+    }, { qtySold: 0, totalRevenue: 0, gst: 0 })
+
+    // Paginate
+    const paginatedResults = allResults.slice(skip, skip + limitNum)
+    const totalPages = Math.ceil(totalItems / limitNum)
+
+    res.status(200).json({
+      success: true,
+      groupBy: 'item',
+      startDate,
+      endDate,
+      data: paginatedResults,
+      totals: {
+        qtySold: totals.qtySold,
+        totalRevenue: Math.round(totals.totalRevenue * 100) / 100,
+        gst: Math.round(totals.gst * 100) / 100,
+      },
+      pagination: {
+        currentPage: pageNum,
+        totalPages,
+        totalItems,
+        itemsPerPage: limitNum,
+        hasNextPage: pageNum < totalPages,
+        hasPrevPage: pageNum > 1,
+      }
+    })
+
+  } else {
+    res.status(400)
+    throw new Error("groupBy must be 'category' or 'item'")
+  }
+})
+
+// ─── GET /api/v1/hotel/counter-order/non-chargeable-orders ───────────────────
+// Paginated listing of actual non-chargeable order documents (not the rollup).
+// Supports date filter, branch filter, type filter, search, and pagination.
+exports.getNonChargeableOrders = asyncHandler(async (req, res) => {
+  const {
+    branchId,
+    date,
+    startDate,
+    endDate,
+    type, // staff | management | tasting | wastage | other
+    search,
+    page = 1,
+    limit = 50,
+    sortBy = 'createdAt',
+    sortOrder = 'desc',
+  } = req.query
+
+  if (!branchId) {
+    res.status(400)
+    throw new Error("branchId is required")
+  }
+
+  const query = { isNonChargeable: true, branch: branchId }
+
+  // Date filter — business-day aware
+  if (date) {
+    const { start, end } = businessDayRange(date)
+    if (start && end) query.createdAt = { $gte: start, $lte: end }
+  } else if (startDate || endDate) {
+    const range = {}
+    if (startDate) {
+      const s = businessDayRange(startDate)
+      if (s.start) range.$gte = s.start
+    }
+    if (endDate) {
+      const e = businessDayRange(endDate)
+      const bound = e.exact ? e.start : e.end
+      if (bound) range.$lte = bound
+    }
+    if (Object.keys(range).length > 0) query.createdAt = range
+  }
+
+  // Type filter
+  if (type) {
+    query.nonChargeableType = type
+  }
+
+  // Search
+  if (search && search.trim()) {
+    const searchRegex = new RegExp(search.trim(), 'i')
+    query.$or = [
+      { customerName: searchRegex },
+      { invoiceNumber: searchRegex },
+      { nonChargeableReason: searchRegex },
+      { nonChargeableBy: searchRegex },
+    ]
+  }
+
+  const pageNum = parseInt(page)
+  const limitNum = parseInt(limit)
+  const skip = (pageNum - 1) * limitNum
+
+  const sort = {}
+  sort[sortBy] = sortOrder === 'asc' ? 1 : -1
+
+  const [orders, totalCount] = await Promise.all([
+    CounterOrder.find(query)
+      .populate("branch", "name address")
+      .populate("items.menuItemId", "name")
+      .sort(sort)
+      .skip(skip)
+      .limit(limitNum)
+      .lean(),
+    CounterOrder.countDocuments(query)
+  ])
+
+  const formattedOrders = orders.map((order) => ({
+    id: order._id,
+    invoiceNumber: order.invoiceNumber,
+    customerName: order.customerName || 'Walk-in Customer',
+    tableNumber: order.tableNumber || null,
+    items: order.items || [],
+    originalGrandTotal: order.originalGrandTotal || order.grandTotal || 0,
+    totalAmount: order.originalGrandTotal || order.totalAmount || 0,
+    grandTotal: order.grandTotal || 0,
+    isNonChargeable: true,
+    nonChargeableReason: order.nonChargeableReason,
+    nonChargeableType: order.nonChargeableType,
+    nonChargeableBy: order.nonChargeableBy,
+    nonChargeableAt: order.nonChargeableAt,
+    categoryName: order.categoryName || null,
+    paymentMethod: order.paymentMethod,
+    createdAt: order.createdAt,
+  }))
+
+  const totalPages = Math.ceil(totalCount / limitNum)
+
+  res.status(200).json({
+    success: true,
+    message: "Non-chargeable orders retrieved successfully",
+    count: formattedOrders.length,
+    data: formattedOrders,
+    orders: formattedOrders,
+    pagination: {
+      currentPage: pageNum,
+      totalPages,
+      totalItems: totalCount,
+      itemsPerPage: limitNum,
+      hasNextPage: pageNum < totalPages,
+      hasPrevPage: pageNum > 1
+    },
+    summary: {
+      totalBills: totalCount,
+      totalAmount: orders.reduce((sum, o) => sum + (o.originalGrandTotal || o.totalAmount || 0), 0),
+    }
+  })
+})
+
+// ─── GET /api/v1/hotel/counter-order/non-chargeable-summary ──────────────────
+// Per-day rollup for reporting: totals plus the split by type.
+exports.getNonChargeableSummary = asyncHandler(async (req, res) => {
+  const { branchId } = req.query
+  const date = req.query.date || businessDayKey()
+
+  if (!branchId) {
+    res.status(400)
+    throw new Error("branchId is required")
+  }
+
+  const tracking = await NonChargeableTracking.findOne({ branchId, date }).lean()
+
+  res.status(200).json({
+    success: true,
+    date,
+    summary: tracking || {
+      branchId,
+      date,
+      totalNonChargeableBills: 0,
+      totalNonChargeableAmount: 0,
+      byType: { staff: 0, management: 0, tasting: 0, wastage: 0, other: 0 },
+      nonChargeableBills: [],
+    },
   })
 })
