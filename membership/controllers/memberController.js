@@ -22,7 +22,7 @@ const saveFileLocally = (file, folder) => {
 // @route   POST /api/v1/hotel/member/create
 // @access  Private/Admin
 const createMember = asyncHandler(async (req, res) => {
-  const { name, email, password, phone, dateOfBirth, address, joiningDate, validUntil, initialWalletBalance } = req.body;
+  const { name, email, password, phone, dateOfBirth, address, joiningDate, validUntil, initialWalletBalance, membershipType, membershipId } = req.body;
 
   if (!name || !email || !password || !phone) {
     res.status(400);
@@ -36,7 +36,23 @@ const createMember = asyncHandler(async (req, res) => {
     throw new Error("Member with this email already exists");
   }
 
-  // Create member
+  // Check if phone already exists
+  const existingPhone = await Member.findOne({ phone });
+  if (existingPhone) {
+    res.status(400);
+    throw new Error("Member with this phone number already exists");
+  }
+
+  // Check if membershipId already exists (if provided)
+  if (membershipId) {
+    const existingId = await Member.findOne({ membershipId });
+    if (existingId) {
+      res.status(400);
+      throw new Error("This membership ID is already in use");
+    }
+  }
+
+  // Create member (fully registered — can login directly)
   const member = await Member.create({
     name,
     email,
@@ -44,6 +60,9 @@ const createMember = asyncHandler(async (req, res) => {
     phone,
     dateOfBirth,
     address,
+    membershipType: membershipType || "Member",
+    membershipId: membershipId || undefined,
+    registrationStatus: "completed",
     joiningDate: joiningDate || Date.now(),
     validUntil: validUntil || new Date(new Date().setFullYear(new Date().getFullYear() + 1)),
     walletBalance: initialWalletBalance || 0,
@@ -329,6 +348,69 @@ const uploadPhoto = asyncHandler(async (req, res) => {
   });
 });
 
+// @desc    Admin partial registration — creates member with type+name+phone only
+// @route   POST /api/v1/hotel/member/register-partial
+// @access  Private/Admin
+const registerPartialMember = asyncHandler(async (req, res) => {
+  const { name, phone, membershipType, membershipId } = req.body;
+
+  if (!name || !phone || !membershipType) {
+    res.status(400);
+    throw new Error("Please provide name, phone, and membershipType");
+  }
+
+  // Validate membership type
+  const { MEMBERSHIP_TYPES } = require("../models/Member");
+  if (!MEMBERSHIP_TYPES.includes(membershipType)) {
+    res.status(400);
+    throw new Error(`Invalid membership type. Allowed: ${MEMBERSHIP_TYPES.join(", ")}`);
+  }
+
+  // Check if phone already exists
+  const existingMember = await Member.findOne({ phone });
+  if (existingMember) {
+    res.status(400);
+    throw new Error("A member with this phone number already exists");
+  }
+
+  // Generate membership ID if not provided by admin
+  let finalMembershipId = membershipId;
+  if (!finalMembershipId) {
+    finalMembershipId = await Member.generateMembershipId(membershipType, name);
+  } else {
+    // Check if provided ID is already taken
+    const existingId = await Member.findOne({ membershipId: finalMembershipId });
+    if (existingId) {
+      res.status(400);
+      throw new Error("This membership ID is already in use");
+    }
+  }
+
+  // Create partial member (no password, no email — member will set these later)
+  const member = await Member.create({
+    name,
+    phone,
+    membershipType,
+    membershipId: finalMembershipId,
+    registrationStatus: "pending",
+    isActive: false, // Not active until registration is completed
+  });
+
+  res.status(201).json({
+    success: true,
+    message: "Member registered (pending completion). Share phone number with the member to complete registration in the app.",
+    member: {
+      id: member._id,
+      memberNumber: member.memberNumber,
+      membershipId: member.membershipId,
+      name: member.name,
+      phone: member.phone,
+      membershipType: member.membershipType,
+      registrationStatus: member.registrationStatus,
+    },
+  });
+});
+
 module.exports = {
   createMember,
   getAllMembers,
@@ -338,4 +420,5 @@ module.exports = {
   uploadDocument,
   uploadPhoto,
   scanMemberQR,
+  registerPartialMember,
 };

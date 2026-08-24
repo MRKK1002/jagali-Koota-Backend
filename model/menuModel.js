@@ -27,11 +27,10 @@ const menuSchema = new mongoose.Schema({
     min: [0, 'GST rate cannot be negative'],
     max: [100, 'GST rate cannot exceed 100%']
   },
-  // Food type for veg/non-veg/egg filtering. Not schema-required so the 20
-  // legacy items without it stay editable; enforced in the create controller.
+  // Food type for filtering. Not schema-required so legacy items stay editable.
   foodType: {
     type: String,
-    enum: ['veg', 'non-veg', 'egg'],
+    enum: ['veg', 'non-veg', 'egg', 'sea-food', 'chef-special', 'spice-level', 'gluten-free'],
     default: null
   },
   // Old structure kept for backward compatibility

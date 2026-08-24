@@ -10,6 +10,7 @@ const {
   uploadDocument,
   uploadPhoto,
   scanMemberQR,
+  registerPartialMember,
 } = require("../controllers/memberController");
 
 // Multer setup for file uploads
@@ -18,6 +19,7 @@ const upload = multer({ storage });
 
 // Admin routes (add admin auth middleware later)
 router.post("/create", createMember);
+router.post("/register-partial", registerPartialMember);
 router.get("/all", getAllMembers);
 router.get("/:id", getMemberById);
 router.put("/:id", updateMember);

@@ -9,7 +9,7 @@ const generateToken = (id) => {
   });
 };
 
-// @desc    Member login
+// @desc    Member login (supports email OR phone)
 // @route   POST /api/v1/hotel/member-auth/login
 // @access  Public
 const loginMember = asyncHandler(async (req, res) => {
@@ -17,15 +17,27 @@ const loginMember = asyncHandler(async (req, res) => {
 
   if (!email || !password) {
     res.status(400);
-    throw new Error("Please provide email and password");
+    throw new Error("Please provide email/phone and password");
   }
 
-  // Find member with password field
-  const member = await Member.findOne({ email }).select("+password");
+  // Support login via email OR phone number
+  const isPhone = /^\d{10,}$/.test(email.replace(/[\s\-\+]/g, ""));
+  let member;
+  if (isPhone) {
+    member = await Member.findOne({ phone: email }).select("+password");
+  } else {
+    member = await Member.findOne({ email }).select("+password");
+  }
 
   if (!member) {
     res.status(401);
-    throw new Error("Invalid email or password");
+    throw new Error("Invalid credentials");
+  }
+
+  // Must have completed registration
+  if (member.registrationStatus === "pending") {
+    res.status(403);
+    throw new Error("Registration not completed. Please complete your registration in the Member App first.");
   }
 
   // Check if membership is active
@@ -45,7 +57,7 @@ const loginMember = asyncHandler(async (req, res) => {
 
   if (!isMatch) {
     res.status(401);
-    throw new Error("Invalid email or password");
+    throw new Error("Invalid credentials");
   }
 
   // Update last login
@@ -62,6 +74,7 @@ const loginMember = asyncHandler(async (req, res) => {
     member: {
       id: member._id,
       memberNumber: member.memberNumber,
+      membershipId: member.membershipId,
       name: member.name,
       email: member.email,
       phone: member.phone,
@@ -192,10 +205,135 @@ const forgotPassword = asyncHandler(async (req, res) => {
   });
 });
 
+// @desc    Check phone — returns member status for unified app flow
+// @route   POST /api/v1/hotel/member-auth/check-phone
+// @access  Public
+const checkPhone = asyncHandler(async (req, res) => {
+  const { phone } = req.body;
+
+  if (!phone) {
+    res.status(400);
+    throw new Error("Please provide phone number");
+  }
+
+  const member = await Member.findOne({ phone });
+
+  if (!member) {
+    res.status(404);
+    throw new Error("Account not found. Please contact admin.");
+  }
+
+  // Return status so app can decide next step
+  // "completed" → show password field (login)
+  // "pending" → show complete profile screen
+  res.json({
+    success: true,
+    registrationStatus: member.registrationStatus,
+    member: {
+      id: member._id,
+      name: member.name,
+      membershipId: member.membershipId,
+      membershipType: member.membershipType,
+      phone: member.phone,
+    },
+  });
+});
+
+// @desc    Complete registration — member sets password + uploads documents
+// @route   POST /api/v1/hotel/member-auth/complete-registration
+// @access  Public
+const completeRegistration = asyncHandler(async (req, res) => {
+  const { phone, password, email, dateOfBirth, address } = req.body;
+
+  if (!phone || !password) {
+    res.status(400);
+    throw new Error("Please provide phone and password");
+  }
+
+  if (password.length < 6) {
+    res.status(400);
+    throw new Error("Password must be at least 6 characters");
+  }
+
+  const member = await Member.findOne({ phone });
+
+  if (!member) {
+    res.status(404);
+    throw new Error("No membership found for this phone number");
+  }
+
+  if (member.registrationStatus === "completed") {
+    res.status(400);
+    throw new Error("Registration already completed. Please login.");
+  }
+
+  // Check email uniqueness if provided
+  if (email) {
+    const emailTaken = await Member.findOne({ email, _id: { $ne: member._id } });
+    if (emailTaken) {
+      res.status(400);
+      throw new Error("This email is already in use by another member");
+    }
+    member.email = email;
+  }
+
+  // Set password and mark registration complete
+  member.password = password;
+  member.registrationStatus = "completed";
+  member.isActive = true;
+
+  // Optional fields
+  if (dateOfBirth) member.dateOfBirth = dateOfBirth;
+  if (address) member.address = address;
+
+  await member.save();
+
+  // Generate QR code now that registration is complete
+  const QRCode = require("qrcode");
+  const qrData = JSON.stringify({
+    memberId: member._id,
+    memberNumber: member.memberNumber,
+    membershipId: member.membershipId,
+    name: member.name,
+    membershipType: member.membershipType,
+  });
+
+  const qrCodeBase64 = await QRCode.toDataURL(qrData, {
+    width: 300,
+    margin: 2,
+  });
+
+  member.qrCode = qrCodeBase64;
+  await member.save();
+
+  // Generate token so member is logged in immediately
+  const token = generateToken(member._id);
+
+  res.json({
+    success: true,
+    message: "Registration completed successfully! Welcome aboard.",
+    token,
+    member: {
+      id: member._id,
+      memberNumber: member.memberNumber,
+      membershipId: member.membershipId,
+      name: member.name,
+      email: member.email,
+      phone: member.phone,
+      membershipType: member.membershipType,
+      walletBalance: member.walletBalance,
+      validUntil: member.validUntil,
+      qrCode: member.qrCode,
+    },
+  });
+});
+
 module.exports = {
   loginMember,
   getMemberProfile,
   updateMemberProfile,
   changePassword,
   forgotPassword,
+  checkPhone,
+  completeRegistration,
 };

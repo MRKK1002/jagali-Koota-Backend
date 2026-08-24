@@ -29,6 +29,8 @@ function setMenuCached(key, data) {
 function invalidateMenuCache() {
   menuCache.clear()
 }
+// Export for use by other controllers (e.g. categoryController)
+exports.invalidateMenuCache = invalidateMenuCache
 // ─── End Cache ──────────────────────────────────────────────────────────────
 
 exports.createMenuItem = async (req, res) => {
@@ -67,10 +69,10 @@ exports.createMenuItem = async (req, res) => {
     // Subcategory is optional — not all categories need subcategories.
     // If provided, it will be stored; otherwise null.
 
-    // Food type is required for new items (veg / non-veg / egg).
-    const allowedFoodTypes = ['veg', 'non-veg', 'egg'];
+    // Food type is required for new items.
+    const allowedFoodTypes = ['veg', 'non-veg', 'egg', 'sea-food', 'chef-special', 'spice-level', 'gluten-free'];
     if (!foodType || !allowedFoodTypes.includes(foodType)) {
-      return res.status(400).json({ message: 'Food type is required and must be one of: veg, non-veg, egg' });
+      return res.status(400).json({ message: 'Food type is required and must be one of: veg, non-veg, egg, sea-food, chef-special, spice-level, gluten-free' });
     }
 
 
@@ -519,7 +521,7 @@ exports.updateMenuItem = async (req, res) => {
 
     // Only update foodType when a valid value is sent, so editing a legacy
     // item without choosing one never wipes an existing value.
-    if (['veg', 'non-veg', 'egg'].includes(foodType)) {
+    if (['veg', 'non-veg', 'egg', 'sea-food', 'chef-special', 'spice-level', 'gluten-free'].includes(foodType)) {
       updateData.foodType = foodType;
     }
 

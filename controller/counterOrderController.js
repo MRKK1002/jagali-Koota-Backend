@@ -657,6 +657,16 @@ exports.getAllCounterOrders = asyncHandler(async (req, res) => {
     if (Object.keys(range).length > 0) query.createdAt = range;
   }
 
+  // DEFAULT: If no date filter was applied and fetchAll is not requested,
+  // limit to last 2 days (today + yesterday) for performance.
+  // Admin panel passes fetchAll=true to get all historical data.
+  if (!query.createdAt && req.query.fetchAll !== 'true') {
+    const twoDaysAgo = new Date();
+    twoDaysAgo.setDate(twoDaysAgo.getDate() - 1);
+    twoDaysAgo.setHours(0, 0, 0, 0);
+    query.createdAt = { $gte: twoDaysAgo };
+  }
+
   // Add search filter - search by customer name, phone number, invoice number, KOT number
   if (search && search.trim() !== '') {
     const searchRegex = new RegExp(search.trim(), 'i');
@@ -941,15 +951,19 @@ exports.updateCounterOrder = asyncHandler(async (req, res) => {
   // If items are being updated, recalculate totals
   if (updateData.items) {
     let calculatedSubtotal = 0
+    let calculatedGst = 0
     for (const item of updateData.items) {
       calculatedSubtotal += item.price * item.quantity
+      const rate = item.gstRate || 0
+      calculatedGst += (item.price * item.quantity * rate) / 100
     }
 
     updateData.subtotal = calculatedSubtotal
-    updateData.tax = calculatedSubtotal * TAX_RATE
-    updateData.serviceCharge = calculatedSubtotal * SERVICE_CHARGE_RATE
-    updateData.totalAmount = calculatedSubtotal
-    updateData.grandTotal = calculatedSubtotal + updateData.tax + updateData.serviceCharge
+    updateData.gstAmount = calculatedGst
+    updateData.tax = calculatedGst
+    updateData.serviceCharge = 0
+    updateData.totalAmount = calculatedSubtotal + calculatedGst
+    updateData.grandTotal = calculatedSubtotal + calculatedGst
   }
 
   // Update the order
