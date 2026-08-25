@@ -234,7 +234,7 @@ const counterOrderSchema = new mongoose.Schema({
   paymentMethod: {
     type: String,
     required: [true, "Payment method is required"],
-    enum: ["cash", "card", "upi", "qr"],
+    enum: ["cash", "card", "upi", "qr", "wallet"],
   },
   orderStatus: {
     type: String,

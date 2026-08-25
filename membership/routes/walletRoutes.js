@@ -27,13 +27,13 @@ router.get("/all-transactions", getAllWalletTransactions);
 // POST /api/v1/hotel/wallet/deduct-for-order
 router.post("/deduct-for-order", async (req, res) => {
   try {
-    const { orderId, memberPhone, amount } = req.body;
+    const { orderId, orderIds, memberPhone, amount } = req.body;
 
     // Validate inputs
-    if (!orderId || !memberPhone || !amount) {
+    if ((!orderId && (!orderIds || orderIds.length === 0)) || !memberPhone || !amount) {
       return res.status(400).json({
         success: false,
-        message: "Missing required fields: orderId, memberPhone, amount",
+        message: "Missing required fields: orderId/orderIds, memberPhone, amount",
       });
     }
 
@@ -64,37 +64,48 @@ router.post("/deduct-for-order", async (req, res) => {
       });
     }
 
+    // Build the list of all order IDs to update
+    const allOrderIds = orderIds && orderIds.length > 0
+      ? [...new Set(orderIds)]
+      : (orderId ? [orderId] : []);
+
+    const primaryOrderId = allOrderIds[0];
+
     // Create wallet transaction (this also updates member balance)
     const transaction = await WalletTransaction.createTransaction({
       memberId: member._id,
       type: "debit",
       amount: amount,
-      description: `Payment for order ${orderId}`,
-      orderId: orderId,
+      description: `Payment for order ${primaryOrderId}`,
+      orderId: primaryOrderId,
       createdBy: "system",
       metadata: {
         source: "counter_bill",
         memberApp: true,
+        allOrderIds: allOrderIds,
       },
     });
 
-    // Update order payment status
+    // Update ALL order payment statuses
     try {
       const CounterOrder =
         mongoose.connection.models.CounterOrder ||
         mongoose.connection.models.counterOrder ||
         mongoose.connection.models["counter-order"];
 
-      if (CounterOrder) {
-        await CounterOrder.findByIdAndUpdate(orderId, {
-          paymentMethod: "wallet",
-          paymentStatus: "paid",
-          walletDeducted: true,
-          walletDeductedAt: new Date(),
-        });
+      if (CounterOrder && allOrderIds.length > 0) {
+        await CounterOrder.updateMany(
+          { _id: { $in: allOrderIds } },
+          {
+            paymentMethod: "wallet",
+            paymentStatus: "paid",
+            walletDeducted: true,
+            walletDeductedAt: new Date(),
+          }
+        );
       }
     } catch (orderError) {
-      console.error("Error updating order:", orderError);
+      console.error("Error updating orders:", orderError);
     }
 
     return res.status(200).json({
@@ -201,6 +212,134 @@ router.get("/member-by-order/:orderId", async (req, res) => {
       success: false,
       message: "Failed to fetch member details",
       error: error.message,
+    });
+  }
+});
+
+// ─── NEW: Complete order from Member App — deduct wallet, mark completed, free table ──
+// POST /api/v1/hotel/wallet/complete-member-order
+router.post("/complete-member-order", async (req, res) => {
+  try {
+    const { orderIds, tableId, memberPhone } = req.body;
+
+    // Validate inputs
+    if (!orderIds || !Array.isArray(orderIds) || orderIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required field: orderIds (array of KOT IDs)",
+      });
+    }
+    if (!memberPhone) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required field: memberPhone",
+      });
+    }
+
+    // Find member
+    const member = await Member.findOne({ phone: memberPhone });
+    if (!member) {
+      return res.status(404).json({
+        success: false,
+        message: "Member not found",
+      });
+    }
+
+    // Find the CounterOrder model
+    const CounterOrder =
+      mongoose.connection.models.CounterOrder ||
+      mongoose.connection.models.counterOrder ||
+      mongoose.connection.models["counter-order"];
+
+    if (!CounterOrder) {
+      return res.status(500).json({
+        success: false,
+        message: "Order model not available",
+      });
+    }
+
+    // Fetch all orders and calculate total
+    const orders = await CounterOrder.find({ _id: { $in: orderIds } });
+    if (orders.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No orders found for given IDs",
+      });
+    }
+
+    const totalAmount = orders.reduce((sum, order) => {
+      return sum + (order.grandTotal || order.totalAmount || 0);
+    }, 0);
+
+    // Check wallet balance
+    const currentBalance = member.walletBalance || 0;
+    if (currentBalance < totalAmount) {
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient wallet balance",
+        currentBalance: currentBalance,
+        requiredAmount: totalAmount,
+        shortBy: totalAmount - currentBalance,
+      });
+    }
+
+    // Deduct from wallet
+    const transaction = await WalletTransaction.createTransaction({
+      memberId: member._id,
+      type: "debit",
+      amount: totalAmount,
+      description: `Order payment - Table ${orders[0].tableNumber || "N/A"}`,
+      orderId: orderIds[0],
+      createdBy: "system",
+      metadata: {
+        source: "member_app_complete",
+        allOrderIds: orderIds,
+        tableNumber: orders[0].tableNumber,
+      },
+    });
+
+    // Mark all KOTs as completed and paid
+    await CounterOrder.updateMany(
+      { _id: { $in: orderIds } },
+      {
+        paymentMethod: "wallet",
+        paymentStatus: "paid",
+        orderStatus: "completed",
+        status: "completed",
+        walletDeducted: true,
+        walletDeductedAt: new Date(),
+      }
+    );
+
+    // Free the table
+    if (tableId) {
+      try {
+        const Table =
+          mongoose.connection.models.Table ||
+          mongoose.connection.model("Table");
+        await Table.findByIdAndUpdate(tableId, { status: "available" });
+      } catch (tableErr) {
+        console.warn("Failed to free table:", tableErr.message);
+        // Don't fail the whole request if table update fails
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Order completed successfully",
+      transaction: {
+        amount: transaction.amount,
+        balanceBefore: transaction.balanceBefore,
+        balanceAfter: transaction.balanceAfter,
+      },
+      totalAmount: totalAmount,
+      ordersCompleted: orders.length,
+    });
+  } catch (error) {
+    console.error("Error completing member order:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to complete order",
     });
   }
 });
