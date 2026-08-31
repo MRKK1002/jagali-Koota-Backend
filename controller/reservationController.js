@@ -90,6 +90,36 @@ const createReservation = async (req, res) => {
       .populate("customerId", "name mobileNumber email")
 
     res.status(201).json(populatedReservation)
+
+    // 🔔 Notify member about reservation confirmation (if phone matches a member)
+    try {
+      const {sendToMemberByPhone} = require("../services/firebaseNotification");
+      const resDate = new Date(reservationDate).toLocaleDateString("en-IN", {day: "numeric", month: "short", year: "numeric"});
+      sendToMemberByPhone(
+        customerPhone,
+        "Reservation Confirmed!",
+        `Your table for ${guestCount} guests on ${resDate} at ${timeSlot} is reserved.`,
+        {type: "reservation_confirmed"}
+      ).catch(() => {});
+    } catch (fcmErr) { /* non-blocking */ }
+
+    // 🔔 Notify admin panel via Socket.IO
+    try {
+      const io = req.app.get('io');
+      if (io) {
+        io.emit('new-reservation', {
+          id: populatedReservation._id,
+          customerName,
+          customerPhone,
+          tableNumber: populatedReservation.tableId?.number || '',
+          guestCount,
+          reservationDate,
+          timeSlot,
+          createdAt: new Date().toISOString(),
+        });
+        console.log('🔔 Emitting new-reservation event via Socket.IO');
+      }
+    } catch (socketErr) { /* non-blocking */ }
   } catch (err) {
     console.error("Error creating reservation:", err)
     res.status(500).json({ error: err.message })

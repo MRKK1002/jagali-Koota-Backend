@@ -92,6 +92,19 @@ mongoose
   .then(() => {
     console.log("✅ MongoDB Connected Successfully");
     console.log("📊 Database:", mongoose.connection.name);
+    // Start crons after DB is ready
+    const {
+      startMonthlyServiceChargeCron,
+      startBirthdayCron,
+      startExpiryReminderCron,
+      startAnniversaryCron,
+      startMonthlyStatementCron,
+    } = require("./services/monthlyServiceChargeCron");
+    startMonthlyServiceChargeCron();
+    startBirthdayCron();
+    startExpiryReminderCron();
+    startAnniversaryCron();
+    startMonthlyStatementCron();
   })
   .catch((err) => {
     console.error("❌ MongoDB Connection Error: ", err.message);
@@ -251,6 +264,8 @@ app.use("/api/v1/hotel/member-orders", memberOrderRoutes);
 app.use("/api/v1/hotel/gallery", galleryRoutes);
 app.use("/api/v1/hotel/blacklist", blacklistRoutes);
 app.use("/api/v1/hotel/sales-report", salesReportRoutes);
+app.use("/api/v1/hotel/sports", require("./membership/routes/sportRoutes"));
+app.use("/api/v1/hotel/affiliated-members", require("./membership/routes/affiliatedMemberRoutes"));
 
 // Bill Reset Routes
 app.use("/api/v1/hotel/bill-reset", billResetRoutes);

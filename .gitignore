@@ -6,3 +6,15 @@ AWS.js
 # Zip files
 *.zip
 HotelViratAws.zip
+
+# Firebase / service-account credentials (never commit)
+config/firebase-service-account.json
+*firebase-adminsdk*
+*service-account*.json
+*adminsdk*.json
+
+# Other secrets / keys
+.env.*
+*.pem
+*.key
+*.p12

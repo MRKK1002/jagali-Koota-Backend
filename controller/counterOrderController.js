@@ -37,6 +37,10 @@ function setCachedResponse(key, data) {
 function invalidateOrderCache() {
   orderCache.clear()
 }
+// Exported so other routes (e.g. the Member App wallet completion route) that
+// write to CounterOrder outside this controller can flush the 60s GET cache and
+// have their changes show up immediately instead of after cache expiry.
+exports.invalidateOrderCache = invalidateOrderCache
 // ─── End Cache ──────────────────────────────────────────────────────────────
 
 /**
@@ -475,6 +479,19 @@ exports.createCounterOrder = asyncHandler(async (req, res) => {
       io.emit('order-updated')
     }
   } catch (err) { console.error('Socket emit error:', err.message) }
+
+  // 🔔 Push notification to member (if this is a member app order)
+  try {
+    if (counterOrder.serverName === 'Member App' && counterOrder.phoneNumber) {
+      const { sendToMemberByPhone } = require('../services/firebaseNotification');
+      sendToMemberByPhone(
+        counterOrder.phoneNumber,
+        'Order Sent to Kitchen!',
+        `Your order for Table ${counterOrder.tableNumber || ''} (${counterOrder.items?.length || 0} items) is being prepared.`,
+        { type: 'order_placed', orderId: String(counterOrder._id), tableNumber: counterOrder.tableNumber || '' }
+      ).catch(e => console.warn('[FCM] Non-blocking notification error:', e.message));
+    }
+  } catch (fcmErr) { /* non-blocking */ }
 
   // Auto-deduct raw material stock based on recipe ingredients (non-blocking)
   deductRawMaterialsForOrder(counterOrder.items).catch((err) =>

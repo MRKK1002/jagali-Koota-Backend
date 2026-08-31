@@ -13,23 +13,21 @@ const Member = require("../models/Member");
 const WalletTransaction = require("../models/WalletTransaction");
 const mongoose = require("mongoose");
 
-// Member routes (protected)
+
 router.get("/balance", protectMember, getWalletBalance);
 router.get("/transactions", protectMember, getWalletTransactions);
 
-// Admin routes (add admin auth middleware later)
 router.post("/add-money", addMoneyToWallet);
 router.post("/deduct", deductMoneyFromWallet);
 router.post("/admin-transaction", adminWalletTransaction);
 router.get("/all-transactions", getAllWalletTransactions);
 
-// ─── NEW: Deduct from wallet for counter bill (Member App orders) ───────────
-// POST /api/v1/hotel/wallet/deduct-for-order
+
 router.post("/deduct-for-order", async (req, res) => {
   try {
     const { orderId, orderIds, memberPhone, amount } = req.body;
 
-    // Validate inputs
+
     if ((!orderId && (!orderIds || orderIds.length === 0)) || !memberPhone || !amount) {
       return res.status(400).json({
         success: false,
@@ -44,7 +42,7 @@ router.post("/deduct-for-order", async (req, res) => {
       });
     }
 
-    // Find member by phone
+
     const member = await Member.findOne({ phone: memberPhone });
     if (!member) {
       return res.status(404).json({
@@ -64,14 +62,13 @@ router.post("/deduct-for-order", async (req, res) => {
       });
     }
 
-    // Build the list of all order IDs to update
+
     const allOrderIds = orderIds && orderIds.length > 0
       ? [...new Set(orderIds)]
       : (orderId ? [orderId] : []);
 
     const primaryOrderId = allOrderIds[0];
 
-    // Create wallet transaction (this also updates member balance)
     const transaction = await WalletTransaction.createTransaction({
       memberId: member._id,
       type: "debit",
@@ -86,7 +83,6 @@ router.post("/deduct-for-order", async (req, res) => {
       },
     });
 
-    // Update ALL order payment statuses
     try {
       const CounterOrder =
         mongoose.connection.models.CounterOrder ||
@@ -107,6 +103,19 @@ router.post("/deduct-for-order", async (req, res) => {
     } catch (orderError) {
       console.error("Error updating orders:", orderError);
     }
+
+    // 🔔 Push notification to member — counter deducted from wallet
+    try {
+      const { sendToDevice } = require("../../services/firebaseNotification");
+      if (member.fcmToken) {
+        sendToDevice(
+          member.fcmToken,
+          "Wallet Payment",
+          `₹${amount.toFixed(2)} has been deducted from your wallet for your order.`,
+          { type: "wallet_deducted", amount: String(amount) }
+        ).catch(() => {});
+      }
+    } catch (fcmErr) { /* non-blocking */ }
 
     return res.status(200).json({
       success: true,
@@ -267,9 +276,14 @@ router.post("/complete-member-order", async (req, res) => {
       });
     }
 
-    const totalAmount = orders.reduce((sum, order) => {
+    const subtotalBeforeDiscount = orders.reduce((sum, order) => {
       return sum + (order.grandTotal || order.totalAmount || 0);
     }, 0);
+
+    // Apply member discount
+    const effectiveDiscount = member.getEffectiveDiscount ? member.getEffectiveDiscount() : 0;
+    const discountAmount = Math.round((subtotalBeforeDiscount * effectiveDiscount) / 100);
+    const totalAmount = subtotalBeforeDiscount - discountAmount;
 
     // Check wallet balance
     const currentBalance = member.walletBalance || 0;
@@ -280,6 +294,7 @@ router.post("/complete-member-order", async (req, res) => {
         currentBalance: currentBalance,
         requiredAmount: totalAmount,
         shortBy: totalAmount - currentBalance,
+        discount: { percentage: effectiveDiscount, amount: discountAmount },
       });
     }
 
@@ -288,28 +303,84 @@ router.post("/complete-member-order", async (req, res) => {
       memberId: member._id,
       type: "debit",
       amount: totalAmount,
-      description: `Order payment - Table ${orders[0].tableNumber || "N/A"}`,
+      description: `Order payment - Table ${orders[0].tableNumber || "N/A"}${effectiveDiscount > 0 ? ` (${effectiveDiscount}% member discount applied)` : ''}`,
       orderId: orderIds[0],
       createdBy: "system",
       metadata: {
         source: "member_app_complete",
         allOrderIds: orderIds,
         tableNumber: orders[0].tableNumber,
+        subtotalBeforeDiscount,
+        discountPercentage: effectiveDiscount,
+        discountAmount,
       },
     });
 
-    // Mark all KOTs as completed and paid
+    // Mark all KOTs as completed and paid.
+    // Values match the Counter flow (counterOrderController): orderStatus and
+    // paymentStatus both use "completed" — the only valid enum values on the
+    // CounterOrder schema. "paid"/"status"/"walletDeducted" are NOT on the
+    // schema/enum and were being silently dropped or written as garbage.
     await CounterOrder.updateMany(
       { _id: { $in: orderIds } },
       {
         paymentMethod: "wallet",
-        paymentStatus: "paid",
+        paymentStatus: "completed",
         orderStatus: "completed",
-        status: "completed",
-        walletDeducted: true,
-        walletDeductedAt: new Date(),
       }
     );
+
+    // Generate an invoice number and create a consolidated bill entry so the
+    // counter's Sales Report recognises this as a settled bill.
+    try {
+      const BillNumberService = require("../../services/billNumberService");
+      const branchId = orders[0].branch || orders[0].branchId;
+      const categoryName = orders[0].categoryName || "Restaurant";
+      const invoiceNumber = await BillNumberService.getNextBillNumber(
+        branchId,
+        categoryName
+      );
+
+      // Create a consolidated bill record (no kotNumber = real bill)
+      const allItems = orders.reduce((acc, o) => [...acc, ...(o.items || [])], []);
+      await CounterOrder.create({
+        branch: branchId,
+        userId: orders[0].userId,
+        customerName: orders[0].customerName || "Member",
+        phoneNumber: orders[0].phoneNumber,
+        tableNumber: orders[0].tableNumber,
+        tableId: tableId || orders[0].tableId,
+        serverName: "Member App",
+        items: allItems,
+        subtotal: totalAmount,
+        totalAmount: totalAmount,
+        grandTotal: totalAmount,
+        gstAmount: 0,
+        paymentMethod: "wallet",
+        paymentStatus: "completed",
+        orderStatus: "completed",
+        invoiceNumber: invoiceNumber,
+        categoryName: categoryName,
+        branchName: orders[0].branchName || "Restaurant",
+        source: "member-app",
+        notes: "Completed via Member App wallet payment",
+      });
+
+      // Mark the original KOTs as consolidated (so they don't show as separate entries)
+      await CounterOrder.updateMany(
+        { _id: { $in: orderIds } },
+        { paymentStatus: "consolidated", orderStatus: "completed" }
+      );
+    } catch (billErr) {
+      console.warn("Failed to create consolidated bill (order still marked completed):", billErr.message);
+      // Non-blocking — the order is already completed/paid even if bill creation fails
+    }
+
+    // Invalidate the counter order GET cache so fresh data is returned immediately
+    try {
+      const { invalidateOrderCache } = require("../../controller/counterOrderController");
+      if (typeof invalidateOrderCache === "function") invalidateOrderCache();
+    } catch (_) {}
 
     // Free the table
     if (tableId) {
@@ -324,6 +395,41 @@ router.post("/complete-member-order", async (req, res) => {
       }
     }
 
+    // 🔔 Push notification to member — wallet deducted, order completed
+    try {
+      const { sendToMember } = require("../../services/firebaseNotification");
+      sendToMember(
+        member._id,
+        "Payment Successful!",
+        `₹${totalAmount.toFixed(2)} deducted from wallet. Table ${orders[0].tableNumber || ""} order completed.`,
+        { type: "wallet_deducted", amount: String(totalAmount), tableNumber: orders[0].tableNumber || "" }
+      ).catch(() => {});
+    } catch (fcmErr) { /* non-blocking */ }
+
+    // 📧 Email receipt + low balance alert
+    try {
+      if (member.email) {
+        const { sendReceiptEmail, sendLowBalanceEmail } = require("../../services/emailService");
+        const allItems = orders.reduce((acc, o) => [...acc, ...(o.items || [])], []);
+        sendReceiptEmail(member.email, {
+          name: member.name,
+          tableNumber: orders[0].tableNumber,
+          items: allItems,
+          subtotal: subtotalBeforeDiscount,
+          discountPercent: effectiveDiscount,
+          discountAmount,
+          total: totalAmount,
+          balanceAfter: transaction.balanceAfter,
+        }).catch((e) => console.warn("[Receipt Email] Failed:", e.message));
+
+        // Low balance alert (threshold ₹500)
+        const LOW_BALANCE_THRESHOLD = 500;
+        if (transaction.balanceAfter < LOW_BALANCE_THRESHOLD) {
+          sendLowBalanceEmail(member.email, member.name, transaction.balanceAfter, LOW_BALANCE_THRESHOLD).catch(() => {});
+        }
+      }
+    } catch (_) {}
+
     return res.status(200).json({
       success: true,
       message: "Order completed successfully",
@@ -333,6 +439,11 @@ router.post("/complete-member-order", async (req, res) => {
         balanceAfter: transaction.balanceAfter,
       },
       totalAmount: totalAmount,
+      subtotalBeforeDiscount,
+      discount: {
+        percentage: effectiveDiscount,
+        amount: discountAmount,
+      },
       ordersCompleted: orders.length,
     });
   } catch (error) {
@@ -341,6 +452,52 @@ router.post("/complete-member-order", async (req, res) => {
       success: false,
       message: error.message || "Failed to complete order",
     });
+  }
+});
+
+// ─── ADMIN: Manually trigger monthly service charge (for testing) ────────────
+// POST /api/v1/hotel/wallet/run-service-charge
+router.post("/run-service-charge", async (req, res) => {
+  try {
+    const members = await Member.find({
+      isActive: true,
+      monthlyServiceCharge: { $gt: 0 },
+    }).select("_id name phone walletBalance monthlyServiceCharge fcmToken");
+
+    let results = [];
+    for (const member of members) {
+      const charge = member.monthlyServiceCharge;
+      if ((member.walletBalance || 0) < charge) {
+        results.push({ name: member.name, status: "failed", reason: "Insufficient balance" });
+        continue;
+      }
+
+      const transaction = await WalletTransaction.createTransaction({
+        memberId: member._id,
+        type: "debit",
+        amount: charge,
+        description: `Monthly service charge — ${new Date().toLocaleDateString("en-IN", { month: "long", year: "numeric" })}`,
+        createdBy: "system",
+        metadata: { source: "monthly_service_charge_manual" },
+      });
+
+      // Notification
+      if (member.fcmToken) {
+        const { sendToDevice } = require("../../services/firebaseNotification");
+        sendToDevice(
+          member.fcmToken,
+          "Monthly Service Charge",
+          `₹${charge.toFixed(2)} deducted as monthly service charge. Balance: ₹${transaction.balanceAfter.toFixed(2)}`,
+          { type: "service_charge_deducted", amount: String(charge) }
+        ).catch(() => {});
+      }
+
+      results.push({ name: member.name, status: "success", charged: charge, newBalance: transaction.balanceAfter });
+    }
+
+    res.json({ success: true, message: "Service charge processed", results });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 

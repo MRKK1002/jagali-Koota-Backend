@@ -101,6 +101,7 @@ const getMemberProfile = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     member,
+    effectiveDiscount: member.getEffectiveDiscount(),
   });
 });
 
@@ -115,7 +116,7 @@ const updateMemberProfile = asyncHandler(async (req, res) => {
     throw new Error("Member not found");
   }
 
-  const { name, phone, dateOfBirth, address, profileImage } = req.body;
+  const { name, phone, dateOfBirth, address, profileImage, discountPercentage } = req.body;
 
   // Update fields
   if (name) member.name = name;
@@ -123,6 +124,7 @@ const updateMemberProfile = asyncHandler(async (req, res) => {
   if (dateOfBirth) member.dateOfBirth = dateOfBirth;
   if (address) member.address = address;
   if (profileImage) member.profileImage = profileImage;
+  if (discountPercentage !== undefined) member.discountPercentage = Number(discountPercentage);
 
   const updatedMember = await member.save();
 
@@ -178,30 +180,98 @@ const changePassword = asyncHandler(async (req, res) => {
 // @route   POST /api/v1/hotel/member-auth/forgot-password
 // @access  Public
 const forgotPassword = asyncHandler(async (req, res) => {
-  const { email } = req.body;
+  const { email, phone } = req.body;
 
-  if (!email) {
+  if (!email && !phone) {
     res.status(400);
-    throw new Error("Please provide email");
+    throw new Error("Please provide email or phone");
   }
 
-  const member = await Member.findOne({ email });
+  // Look up member by email or phone
+  const query = email ? { email } : { phone };
+  const member = await Member.findOne(query);
 
   if (!member) {
-    // Don't reveal if email exists
-    res.json({
-      success: true,
-      message: "If email exists, password reset instructions have been sent",
-    });
-    return;
+    res.status(404);
+    throw new Error("No account found with these details");
   }
 
-  // TODO: Implement OTP/email sending logic here
-  // For now, just return success message
+  if (!member.email) {
+    res.status(400);
+    throw new Error("No email registered for this account. Please contact admin.");
+  }
+
+  // Generate 6-digit OTP
+  const otp = String(Math.floor(100000 + Math.random() * 900000));
+  member.resetOtp = otp;
+  member.resetOtpExpiry = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+  await member.save();
+
+  // Send OTP via email
+  try {
+    const { sendOtpEmail } = require("../../services/emailService");
+    await sendOtpEmail(member.email, member.name, otp);
+  } catch (emailErr) {
+    console.error("[forgotPassword] Email send failed:", emailErr.message);
+    res.status(500);
+    throw new Error("Failed to send OTP email. Please try again.");
+  }
+
+  // Mask the email for the response (e.g. am***@gmail.com)
+  const [local, domain] = member.email.split("@");
+  const maskedEmail = `${local.slice(0, 2)}${"*".repeat(Math.max(1, local.length - 2))}@${domain}`;
 
   res.json({
     success: true,
-    message: "Password reset instructions have been sent to your email",
+    message: `OTP sent to ${maskedEmail}`,
+    email: member.email,
+  });
+});
+
+// @desc    Reset password using OTP
+// @route   POST /api/v1/hotel/member-auth/reset-password
+// @access  Public
+const resetPassword = asyncHandler(async (req, res) => {
+  const { email, phone, otp, newPassword } = req.body;
+
+  if ((!email && !phone) || !otp || !newPassword) {
+    res.status(400);
+    throw new Error("Please provide email/phone, OTP, and new password");
+  }
+
+  if (newPassword.length < 6) {
+    res.status(400);
+    throw new Error("Password must be at least 6 characters");
+  }
+
+  const query = email ? { email } : { phone };
+  const member = await Member.findOne(query);
+
+  if (!member) {
+    res.status(404);
+    throw new Error("Account not found");
+  }
+
+  // Verify OTP
+  if (!member.resetOtp || member.resetOtp !== otp) {
+    res.status(400);
+    throw new Error("Invalid OTP");
+  }
+
+  if (!member.resetOtpExpiry || new Date() > member.resetOtpExpiry) {
+    res.status(400);
+    throw new Error("OTP has expired. Please request a new one.");
+  }
+
+  // Set new password (pre-save hook will hash it)
+  member.password = newPassword;
+  member.resetOtp = null;
+  member.resetOtpExpiry = null;
+  await member.save();
+
+  res.json({
+    success: true,
+    message: "Password reset successfully. You can now log in.",
   });
 });
 
@@ -334,6 +404,7 @@ module.exports = {
   updateMemberProfile,
   changePassword,
   forgotPassword,
+  resetPassword,
   checkPhone,
   completeRegistration,
 };

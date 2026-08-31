@@ -12,7 +12,7 @@ const eventSchema = new mongoose.Schema(
       required: [true, "Event description is required"],
     },
     images: {
-      type: [String], // Array of S3 URLs
+      type: [String],
       default: [],
     },
     eventDate: {

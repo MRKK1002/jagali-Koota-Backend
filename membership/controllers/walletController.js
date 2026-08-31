@@ -93,6 +93,35 @@ const addMoneyToWallet = asyncHandler(async (req, res) => {
     transaction,
     newBalance: updatedMember.walletBalance,
   });
+
+  // 🔔 Notify member about wallet top-up
+  try {
+    const {sendToMember} = require("../../services/firebaseNotification");
+    sendToMember(
+      memberId,
+      "Wallet Credited!",
+      `₹${amount.toFixed(2)} has been added to your wallet. New balance: ₹${updatedMember.walletBalance.toFixed(2)}`,
+      {type: "wallet_credit", amount: String(amount)}
+    ).catch(() => {});
+  } catch (fcmErr) { /* non-blocking */ }
+
+  // 📧 Email for wallet top-up
+  try {
+    if (member.email) {
+      const { sendConfirmationEmail } = require("../../services/emailService");
+      sendConfirmationEmail(member.email, {
+        name: member.name,
+        title: "Wallet Recharged!",
+        subtitle: "Money has been added to your wallet",
+        rows: [
+          { label: "Amount Added", value: `₹${Number(amount).toFixed(2)}` },
+          { label: "New Balance", value: `₹${Number(updatedMember.walletBalance).toFixed(2)}` },
+          { label: "Date", value: new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) },
+        ],
+        note: "You can use your wallet balance for orders, events, and subscriptions.",
+      }).catch((e) => console.warn("[Wallet Email] Failed:", e.message));
+    }
+  } catch (_) {}
 });
 
 // @desc    Deduct money from wallet (Internal use - billing)

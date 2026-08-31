@@ -76,6 +76,24 @@ const createEvent = asyncHandler(async (req, res) => {
     message: "Event created successfully",
     event,
   });
+
+  // 🔔 Broadcast notification to all members about new event
+  try {
+    const Member = require("../models/Member");
+    const {sendToMultiple} = require("../../services/firebaseNotification");
+    Member.find({fcmToken: {$ne: null, $exists: true}}).select("fcmToken").lean().then(members => {
+      const tokens = members.map(m => m.fcmToken).filter(Boolean);
+      console.log("[FCM] Broadcasting new event to", tokens.length, "members");
+      if (tokens.length > 0) {
+        sendToMultiple(
+          tokens,
+          "New Event!",
+          `${event.title} — ${new Date(event.eventDate).toLocaleDateString("en-IN", {day: "numeric", month: "short"})}. Book your spot now!`,
+          {type: "new_event", eventId: String(event._id)}
+        ).catch(e => console.warn("[FCM] Broadcast error:", e.message));
+      }
+    }).catch(e => console.warn("[FCM] Member query error:", e.message));
+  } catch (fcmErr) { console.warn("[FCM] Event notification error:", fcmErr.message); }
 });
 
 // @desc    Get all events
@@ -392,6 +410,57 @@ const bookEvent = asyncHandler(async (req, res) => {
     message: "Event booked successfully",
     booking,
   });
+
+  // 🔔 Notify member about booking confirmation
+  try {
+    const {sendToMember} = require("../../services/firebaseNotification");
+    const eventTitle = event.title || "Event";
+    sendToMember(
+      req.member._id,
+      "Booking Confirmed!",
+      `Your booking for "${eventTitle}" is confirmed. See you there!`,
+      {type: "event_booking", bookingId: String(booking._id), eventId: String(event._id)}
+    ).then(() => console.log("[FCM] Booking confirmation sent")).catch(e => console.warn("[FCM] Booking notification error:", e.message));
+  } catch (fcmErr) { console.warn("[FCM] Booking notification error:", fcmErr.message); }
+
+  // 🔔 Notify admin panel via Socket.IO
+  try {
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('new-event-booking', {
+        id: booking._id,
+        eventTitle: event.title,
+        eventDate: event.eventDate,
+        memberName: req.member.name || 'Member',
+        memberPhone: req.member.phone || '',
+        numberOfPeople,
+        totalAmount,
+        createdAt: new Date().toISOString(),
+      });
+      console.log('🔔 Emitting new-event-booking event via Socket.IO');
+    }
+  } catch (socketErr) { /* non-blocking */ }
+
+  // 📧 Email confirmation for event booking
+  try {
+    if (req.member.email) {
+      const { sendConfirmationEmail } = require("../../services/emailService");
+      sendConfirmationEmail(req.member.email, {
+        name: req.member.name,
+        title: "Event Booking Confirmed!",
+        subtitle: `You've booked "${event.title}"`,
+        rows: [
+          { label: "Event", value: event.title },
+          { label: "Date", value: event.eventDate ? new Date(event.eventDate).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "TBA" },
+          { label: "Time", value: event.eventTime || "TBA" },
+          { label: "Location", value: event.location || "Jagali Koota" },
+          { label: "Guests", value: String(numberOfPeople) },
+        ],
+        amount: totalAmount,
+        note: "See you at the event! You can view your booking in the Member App.",
+      }).catch((e) => console.warn("[Event Email] Failed:", e.message));
+    }
+  } catch (_) {}
 });
 
 // @desc    Get member's event bookings
@@ -663,3 +732,4 @@ module.exports = {
   getAllBookings,
   updateBookingStatus,
 };
+ 

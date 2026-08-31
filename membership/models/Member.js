@@ -25,6 +25,19 @@ const MEMBERSHIP_TYPES = [
   "Member", // backward compatibility
 ];
 
+// Default discount percentage per membership type (used when member.discountPercentage is 0)
+const DEFAULT_DISCOUNTS = {
+  "Senior Life Member": 15,
+  "Life Member": 10,
+  "Platinum Member": 12,
+  "Honorary Member": 20,
+  "Institutional Member": 10,
+  "Temporary Member": 5,
+  "Special Temporary Member": 5,
+  "Affiliated Member": 5,
+  "Member": 0,
+};
+
 const memberSchema = new mongoose.Schema(
   {
     memberNumber: {
@@ -111,6 +124,25 @@ const memberSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    discountPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+    monthlyServiceCharge: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    resetOtp: {
+      type: String,
+      default: null,
+    },
+    resetOtpExpiry: {
+      type: Date,
+      default: null,
+    },
     isActive: {
       type: Boolean,
       default: true,
@@ -137,6 +169,10 @@ const memberSchema = new mongoose.Schema(
     },
     lastLogin: {
       type: Date,
+    },
+    fcmToken: {
+      type: String,
+      default: null,
     },
   },
   {
@@ -202,6 +238,12 @@ memberSchema.methods.comparePassword = async function (candidatePassword) {
   }
 };
 
+// Method to get effective discount (per-member override > membership type default)
+memberSchema.methods.getEffectiveDiscount = function () {
+  if (this.discountPercentage > 0) return this.discountPercentage;
+  return DEFAULT_DISCOUNTS[this.membershipType] || 0;
+};
+
 // Method to check if membership is valid
 memberSchema.methods.isValidMembership = function () {
   return this.isActive && new Date() < this.validUntil;
@@ -225,3 +267,4 @@ const Member = mongoose.model("Member", memberSchema);
 module.exports = Member;
 module.exports.MEMBERSHIP_TYPES = MEMBERSHIP_TYPES;
 module.exports.MEMBERSHIP_PREFIXES = MEMBERSHIP_PREFIXES;
+module.exports.DEFAULT_DISCOUNTS = DEFAULT_DISCOUNTS;

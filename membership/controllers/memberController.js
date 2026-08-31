@@ -51,8 +51,6 @@ const createMember = asyncHandler(async (req, res) => {
       throw new Error("This membership ID is already in use");
     }
   }
-
-  // Create member (fully registered — can login directly)
   const member = await Member.create({
     name,
     email,
@@ -171,6 +169,7 @@ const updateMember = asyncHandler(async (req, res) => {
     validUntil,
     joiningDate,
     address,
+    discountPercentage,
   } = req.body;
 
   // Update fields
@@ -182,6 +181,8 @@ const updateMember = asyncHandler(async (req, res) => {
   if (validUntil) member.validUntil = validUntil;
   if (joiningDate) member.joiningDate = joiningDate;
   if (address) member.address = address;
+  if (discountPercentage !== undefined) member.discountPercentage = Number(discountPercentage);
+  if (req.body.monthlyServiceCharge !== undefined) member.monthlyServiceCharge = Number(req.body.monthlyServiceCharge);
 
   const updatedMember = await member.save();
 
@@ -352,7 +353,7 @@ const uploadPhoto = asyncHandler(async (req, res) => {
 // @route   POST /api/v1/hotel/member/register-partial
 // @access  Private/Admin
 const registerPartialMember = asyncHandler(async (req, res) => {
-  const { name, phone, membershipType, membershipId } = req.body;
+  const { name, phone, email, membershipType, membershipId, initialWalletBalance, sendWelcomeEmail } = req.body;
 
   if (!name || !phone || !membershipType) {
     res.status(400);
@@ -386,32 +387,50 @@ const registerPartialMember = asyncHandler(async (req, res) => {
     }
   }
 
-  // Create partial member (no password, no email — member will set these later)
+  // Create partial member (email captured now, password set later in app)
   const member = await Member.create({
     name,
     phone,
+    email: email || undefined,
     membershipType,
     membershipId: finalMembershipId,
+    walletBalance: Number(initialWalletBalance) || 0,
     registrationStatus: "pending",
     isActive: false, // Not active until registration is completed
   });
 
+  // Send welcome email with app download link + login details
+  if (sendWelcomeEmail && email) {
+    try {
+      const { sendWelcomeMemberEmail } = require("../../services/emailService");
+      sendWelcomeMemberEmail(email, {
+        name,
+        phone,
+        membershipId: finalMembershipId,
+        membershipType,
+        walletBalance: Number(initialWalletBalance) || 0,
+      }).catch((e) => console.warn("[Welcome Email] Failed:", e.message));
+    } catch (e) {
+      console.warn("[Welcome Email] Error:", e.message);
+    }
+  }
+
   res.status(201).json({
     success: true,
-    message: "Member registered (pending completion). Share phone number with the member to complete registration in the app.",
+    message: "Member registered. Welcome email sent with app download link.",
     member: {
       id: member._id,
       memberNumber: member.memberNumber,
       membershipId: member.membershipId,
       name: member.name,
       phone: member.phone,
+      email: member.email,
       membershipType: member.membershipType,
       registrationStatus: member.registrationStatus,
     },
   });
 });
-
-module.exports = {
+   module.exports = {
   createMember,
   getAllMembers,
   getMemberById,

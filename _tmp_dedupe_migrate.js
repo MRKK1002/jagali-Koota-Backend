@@ -43,8 +43,6 @@ async function main() {
     }
     console.log("  backfilled")
   }
-
-  // ── 2. Find duplicate bill groups ────────────────────────────────────────
   const bills = await CounterOrder.find({
     invoiceNumber: { $type: "string", $ne: "" },
     $or: [{ kotNumber: null }, { kotNumber: { $exists: false } }, { kotNumber: "" }],
@@ -52,17 +50,12 @@ async function main() {
     .select("_id invoiceNumber branch createdAt grandTotal totalAmount paymentStatus")
     .sort({ createdAt: 1 })
     .lean()
-
   const groups = {}
   bills.forEach((b) => {
     const k = `${b.branch}|${businessDayKey(b.createdAt)}|${b.invoiceNumber}`
     groups[k] = groups[k] || []
     groups[k].push(b)
   })
-
-  const dups = Object.entries(groups).filter(([, v]) => v.length > 1)
-  console.log(`\nDuplicate bill groups: ${dups.length}`)
-
   const toDelete = []
   let phantom = 0
   dups.forEach(([k, v]) => {
@@ -73,10 +66,6 @@ async function main() {
     // v is sorted oldest-first; keep [0]
     v.slice(1).forEach((d) => toDelete.push(d._id))
   })
-
-  console.log(`\nDocuments to delete: ${toDelete.length}`)
-  console.log(`Phantom revenue removed: Rs ${phantom.toFixed(2)}`)
-
   if (APPLY && toDelete.length > 0) {
     // Back up the ones being deleted
     const doomed = await CounterOrder.find({ _id: { $in: toDelete } }).lean()
@@ -89,8 +78,6 @@ async function main() {
     const r = await CounterOrder.deleteMany({ _id: { $in: toDelete } })
     console.log(`Deleted: ${r.deletedCount}`)
   }
-
-  // ── 3. Build the unique index ────────────────────────────────────────────
   if (APPLY) {
     try {
       await CounterOrder.collection.createIndex(
@@ -109,10 +96,8 @@ async function main() {
       console.log("\nIndex creation failed:", e.message)
     }
   }
-
   await mongoose.disconnect()
 }
-
 main().catch((e) => {
   console.error(e)
   process.exit(1)
