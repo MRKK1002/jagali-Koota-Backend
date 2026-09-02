@@ -127,6 +127,12 @@ const orderSchema = new mongoose.Schema(
   },
 )
 
+// Indexes for common query patterns (filter + newest-first sort).
+// Non-unique, additive — no effect on query results or document shape.
+orderSchema.index({ branchId: 1, createdAt: -1 }) // getAllOrders, getBranchOrders, getOrderStats
+orderSchema.index({ userId: 1, createdAt: -1 })   // getUserOrders, getAllOrders filtered by user
+orderSchema.index({ status: 1, createdAt: -1 })   // status filter + createdAt sort
+
 // Category code mapping for order IDs
 const getCategoryCode = async (items) => {
   if (!items || items.length === 0) return "RES"
